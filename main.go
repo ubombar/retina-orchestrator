@@ -85,7 +85,8 @@ func run() error {
 		rrDisableStaleness            = flag.Bool("rr-disable-staleness", envOrDefaultBool("RETINA_RR_DISABLE_STALENESS", false), "Disable the staleness-based period adjustment (testing only)")
 		rrDisablePeriodAdjustedEvents = flag.Bool("rr-disable-period-adjustment-events", envOrDefaultBool("RETINA_RR_DISABLE_PERIOD_ADJUSTED_EVENTS", true), "Disable emitting period adjusted events")
 		rrDisablePDInsertedEvents     = flag.Bool("rr-disable-pd-inserted-events", envOrDefaultBool("RETINA_RR_DISABLE_PD_INSERTED_EVENTS", true), "Disable emitting PD inserted events")
-		rrDisablePeriodDumpEvents     = flag.Bool("rr-disable-period-dump-events", envOrDefaultBool("RETINA_RR_DISABLE_PERIOD_DUMP_EVENTS", true), "Disable emitting scheduler late events")
+		rrDisablePeriodDumpEvents     = flag.Bool("rr-disable-period-dump-events", envOrDefaultBool("RETINA_RR_DISABLE_PERIOD_DUMP_EVENTS", true), "Disable emitting period dump events")
+		rrDisableSchedulerLateEvents  = flag.Bool("rr-disable-scheduler-late-events", envOrDefaultBool("RETINA_RR_DISABLE_SCHEDULER_LATE_EVENTS", true), "Disable emitting scheduler late events")
 	)
 	flag.Parse()
 
@@ -142,7 +143,7 @@ func run() error {
 			DisablePeriodAdjustedEvents: *rrDisablePeriodAdjustedEvents,
 			DisablePDInsertedEvents:     *rrDisablePDInsertedEvents,
 			DisablePeriodDumps:          *rrDisablePeriodDumpEvents,
-			DisableSchedulerLateEvents:  *rrDisablePeriodDumpEvents,
+			DisableSchedulerLateEvents:  *rrDisableSchedulerLateEvents,
 		},
 	}, logger, metrics)
 	if err != nil {
