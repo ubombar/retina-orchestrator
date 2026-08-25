@@ -172,7 +172,7 @@ func NewOrchestrator(config *Config, logger *slog.Logger, metrics *Metrics) (*Or
 		o.captureCh = make(chan *api.ForwardingInfoElement, config.CaptureChannelSize)
 	}
 
-	ebus, err := NewEventBus(config.EventBusSize, config.EventsDir)
+	ebus, err := NewEventBus(config.EventBusSize, config.EventsDir, config.CapturerConfig.RotationInterval)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating event bus: %w", err)
 	}

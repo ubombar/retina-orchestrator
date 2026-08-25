@@ -226,9 +226,14 @@ type envelope struct{ RetinaEvent }
 // streaming (outside this document's scope). Emission is non-blocking: a slow
 // or absent subscriber is lapped rather than stalling the scheduling loop.
 type EventBus struct {
-	ring       *structures.RingBuffer[envelope]
-	eventsFile *os.File
-	mu         sync.Mutex
+	ring *structures.RingBuffer[envelope]
+
+	eventsDir        string
+	eventsFile       *os.File
+	rotationInterval time.Duration
+	currentRotation  time.Time
+
+	mu sync.Mutex
 }
 
 // Emit stamps the event with its type name and emission time, then publishes
@@ -240,12 +245,17 @@ type EventBus struct {
 // parameter, distinct per call, so no aliasing occurs across emissions.
 func (b *EventBus) Emit(e RetinaEvent) {
 	e.stamp(typeName(e))
+	currentTime := time.Now().UTC()
 
-	if b.eventsFile != nil {
+	if b.eventsDir != "" {
 		data, err := json.Marshal(e)
 		if err == nil {
 			b.mu.Lock()
-			_, _ = b.eventsFile.Write(append(data, '\n'))
+
+			if err := b.rotateIfNeeded(currentTime); err == nil {
+				_, _ = b.eventsFile.Write(append(data, '\n'))
+			}
+
 			b.mu.Unlock()
 		}
 	}
@@ -283,39 +293,51 @@ func typeName(e any) string {
 // NewEventBus creates an EventBus backed by a ring buffer of the given
 // capacity. Capacity bounds how far a slow subscriber may fall behind before
 // it is lapped and starts missing events (§5.5); it must be positive.
-func NewEventBus(capacity int, eventsDir string) (*EventBus, error) {
+func NewEventBus(capacity int, eventsDir string, rotationInterval time.Duration) (*EventBus, error) {
 	ring, err := structures.NewRingBufferTailFollower[envelope](capacity)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create event bus: %w", err)
 	}
 
-	bus := &EventBus{ring: ring}
+	bus := &EventBus{
+		ring:             ring,
+		eventsDir:        eventsDir,
+		rotationInterval: rotationInterval,
+	}
 
 	// An empty events directory disables event persistence.
 	if eventsDir == "" {
 		return bus, nil
 	}
 
+	if rotationInterval <= 0 {
+		return nil, fmt.Errorf("event rotation interval must be positive")
+	}
+
 	if err := os.MkdirAll(eventsDir, 0o750); err != nil {
 		return nil, fmt.Errorf("cannot create events directory: %w", err)
 	}
 
+	currentRotation := time.Now().UTC().Truncate(rotationInterval)
+
 	filename := fmt.Sprintf(
 		"events-%s.jsonl",
-		time.Now().UTC().Format("20060102T150405Z"),
+		currentRotation.Format("20060102T150405Z"),
 	)
 
 	//nolint:gosec
 	file, err := os.OpenFile(
 		filepath.Join(eventsDir, filename),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-		0o644,
+		0o640,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create events file: %w", err)
 	}
 
 	bus.eventsFile = file
+	bus.currentRotation = currentRotation
+
 	return bus, nil
 }
 
@@ -328,4 +350,38 @@ func (b *EventBus) Close() error {
 	}
 
 	return b.eventsFile.Close()
+}
+
+func (b *EventBus) rotateIfNeeded(now time.Time) error {
+	rotation := now.UTC().Truncate(b.rotationInterval)
+
+	if b.eventsFile != nil && rotation.Equal(b.currentRotation) {
+		return nil
+	}
+
+	if b.eventsFile != nil {
+		if err := b.eventsFile.Close(); err != nil {
+			return err
+		}
+	}
+
+	filename := fmt.Sprintf(
+		"events-%s.jsonl",
+		rotation.Format("20060102T150405Z"),
+	)
+
+	//nolint:gosec
+	file, err := os.OpenFile(
+		filepath.Join(b.eventsDir, filename),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+		0o640,
+	)
+	if err != nil {
+		return err
+	}
+
+	b.eventsFile = file
+	b.currentRotation = rotation
+
+	return nil
 }
