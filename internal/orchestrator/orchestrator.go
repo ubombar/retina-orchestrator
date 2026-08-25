@@ -45,6 +45,9 @@ type Config struct {
 	Secret string `json:"secret"`
 
 	EventBusSize int `json:"event_bus_size"`
+	// EventsDir is the directory where orchestrator events are persisted as JSONL.
+	// If empty, event persistence is disabled.
+	EventsDir string `json:"events_dir"`
 
 	// StreamStartFromEarliest controls where a newly connected client's stream
 	// begins. False (default) preserves the original behavior: the client only
@@ -160,7 +163,16 @@ func NewOrchestrator(config *Config, logger *slog.Logger, metrics *Metrics) (*Or
 	}
 	o.fieRingBuffer = ringBuffer
 
-	ebus, err := NewEventBus(config.EventBusSize)
+	if config.CapturerConfig != nil {
+		capturer, err := NewDDBFIECapturer(config.CapturerConfig)
+		if err != nil {
+			return nil, err
+		}
+		o.capturer = capturer
+		o.captureCh = make(chan *api.ForwardingInfoElement, config.CaptureChannelSize)
+	}
+
+	ebus, err := NewEventBus(config.EventBusSize, config.EventsDir)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating event bus: %w", err)
 	}
@@ -185,15 +197,6 @@ func NewOrchestrator(config *Config, logger *slog.Logger, metrics *Metrics) (*Or
 		return nil, fmt.Errorf("error on creating API server: %w", err)
 	}
 	o.apiServer = apiServer
-
-	if config.CapturerConfig != nil {
-		capturer, err := NewDDBFIECapturer(config.CapturerConfig)
-		if err != nil {
-			return nil, err
-		}
-		o.capturer = capturer
-		o.captureCh = make(chan *api.ForwardingInfoElement, config.CaptureChannelSize)
-	}
 
 	return o, nil
 }

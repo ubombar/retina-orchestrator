@@ -18,6 +18,7 @@ CAPTURE_DIR="./captures/$(date -u +%Y%m%d_%H%M%S)"
 	--capturer-allow-non-empty-capture-dir=false \
 	--capturer-batch-size=100000 \
 	--capturer-capture-dir="$CAPTURE_DIR" \
+	--events-dir="$CAPTURE_DIR" \
 	--capturer-rotation-interval=6h \
 	--capturer-channel-size=200000 \
 	--capturer-flush-period=1s \

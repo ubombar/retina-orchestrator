@@ -4,7 +4,10 @@
 package orchestrator
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"time"
@@ -223,7 +226,9 @@ type envelope struct{ RetinaEvent }
 // streaming (outside this document's scope). Emission is non-blocking: a slow
 // or absent subscriber is lapped rather than stalling the scheduling loop.
 type EventBus struct {
-	ring *structures.RingBuffer[envelope]
+	ring       *structures.RingBuffer[envelope]
+	eventsFile *os.File
+	mu         sync.Mutex
 }
 
 // Emit stamps the event with its type name and emission time, then publishes
@@ -235,6 +240,16 @@ type EventBus struct {
 // parameter, distinct per call, so no aliasing occurs across emissions.
 func (b *EventBus) Emit(e RetinaEvent) {
 	e.stamp(typeName(e))
+
+	if b.eventsFile != nil {
+		data, err := json.Marshal(e)
+		if err == nil {
+			b.mu.Lock()
+			_, _ = b.eventsFile.Write(append(data, '\n'))
+			b.mu.Unlock()
+		}
+	}
+
 	b.ring.Push(&envelope{e})
 }
 
@@ -268,10 +283,49 @@ func typeName(e any) string {
 // NewEventBus creates an EventBus backed by a ring buffer of the given
 // capacity. Capacity bounds how far a slow subscriber may fall behind before
 // it is lapped and starts missing events (§5.5); it must be positive.
-func NewEventBus(capacity int) (*EventBus, error) {
+func NewEventBus(capacity int, eventsDir string) (*EventBus, error) {
 	ring, err := structures.NewRingBufferTailFollower[envelope](capacity)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create event bus: %w", err)
 	}
-	return &EventBus{ring: ring}, nil
+
+	bus := &EventBus{ring: ring}
+
+	// An empty events directory disables event persistence.
+	if eventsDir == "" {
+		return bus, nil
+	}
+
+	if err := os.MkdirAll(eventsDir, 0o750); err != nil {
+		return nil, fmt.Errorf("cannot create events directory: %w", err)
+	}
+
+	filename := fmt.Sprintf(
+		"events-%s.jsonl",
+		time.Now().UTC().Format("20060102T150405Z"),
+	)
+
+	//nolint:gosec
+	file, err := os.OpenFile(
+		filepath.Join(eventsDir, filename),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+		0o644,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create events file: %w", err)
+	}
+
+	bus.eventsFile = file
+	return bus, nil
+}
+
+func (b *EventBus) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.eventsFile == nil {
+		return nil
+	}
+
+	return b.eventsFile.Close()
 }

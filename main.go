@@ -53,6 +53,7 @@ func run() error {
 		pdQueueSize          = flag.Int("pd-queue-size", envOrDefaultInt("RETINA_PD_QUEUE_SIZE", 100), "The size of the agent queue")
 		ringBufferSize       = flag.Int("ring-buffer-size", envOrDefaultInt("RETINA_RING_BUFFER_SIZE", 100), "The size of the ring buffer")
 		eventBusSize         = flag.Int("event-bus-size", envOrDefaultInt("RETINA_EVENT_BUS_SIZE", 1024*1024), "Size of the event bus")
+		eventsDir            = flag.String("events-dir", envOrDefault("RETINA_EVENTS_DIR", ""), "Directory where orchestrator events are written as JSONL; empty disables event persistence")
 		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", envOrDefaultDuration("RETINA_API_READ_HEADER_TIMEOUT", 5*time.Second), "Timeout for reading HTTP request headers")
 		fieFilterPolicy      = flag.String("fie-filter-policy", envOrDefault("RETINA_FIE_FILTER_POLICY", "any"), "FIE filtering policy: any, one, or both")
 		logLevel             = flag.String("log-level", envOrDefault("RETINA_LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
@@ -136,6 +137,7 @@ func run() error {
 		FIEFilterPolicy:         *fieFilterPolicy,
 		Secret:                  secret,
 		EventBusSize:            *eventBusSize,
+		EventsDir:               *eventsDir,
 		StreamStartFromEarliest: *streamStartFromEarliest,
 		ResearchSchedulerConfig: &orchestrator.ResearchSchedulerConfig{
 			Seed:                        *rrSeed,
