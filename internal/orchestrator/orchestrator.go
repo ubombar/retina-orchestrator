@@ -340,7 +340,7 @@ func (o *Orchestrator) runAgentServer(ctx context.Context) error {
 	})
 	group.Go(func() error {
 		<-ctx.Done()
-		return o.agentServer.close(3 * time.Second)
+		return o.agentServer.close(10 * time.Second)
 	})
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) && !errors.Is(err, ErrServerShutdown) {
 		return err
