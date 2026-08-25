@@ -232,6 +232,7 @@ func (o *Orchestrator) runCapturer(ctx context.Context) error {
 		return ctx.Err()
 	}
 
+	defer func() { _ = o.capturer.Close() }()
 	group, ctx := errgroup.WithContext(ctx)
 
 	group.Go(func() error {
