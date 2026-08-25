@@ -444,14 +444,16 @@ func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 	o.logger.Info("Agent connected", "agent_id", status.agentID)
 	o.metrics.AgentQueueSize.WithLabelValues(status.agentID).Set(0)
 	o.ebus.Emit(&AgentConnectedEvent{
-		AgentID: status.agentID,
+		AgentID:       status.agentID,
+		RemoteAddress: status.remoteAddress.String(),
 	})
 
 	defer func() {
 		o.logger.Info("Agent disconnected", "agent_id", status.agentID)
 		o.metrics.AgentQueueSize.DeleteLabelValues(status.agentID)
 		o.ebus.Emit(&AgentDisconnectedEvent{
-			AgentID: status.agentID,
+			AgentID:       status.agentID,
+			RemoteAddress: status.remoteAddress.String(),
 		})
 	}()
 

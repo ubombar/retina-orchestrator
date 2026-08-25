@@ -82,7 +82,8 @@ type OrchestratorStoppedEvent struct {
 // component owns agent state.
 type AgentConnectedEvent struct {
 	RetinaBaseEvent
-	AgentID string `json:"agent_id"`
+	AgentID       string `json:"agent_id"`
+	RemoteAddress string `json:"remote_address"`
 }
 
 // AgentDisconnectedEvent is emitted when an agent becomes unavailable (§5.5).
@@ -90,7 +91,8 @@ type AgentConnectedEvent struct {
 // state, not by the Scheduler.
 type AgentDisconnectedEvent struct {
 	RetinaBaseEvent
-	AgentID string `json:"agent_id"`
+	AgentID       string `json:"agent_id"`
+	RemoteAddress string `json:"remote_address"`
 }
 
 // PDInsertedEvent is emitted when an insertion is applied and the PD is
