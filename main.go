@@ -87,6 +87,15 @@ func run() error {
 		rrDisablePDInsertedEvents     = flag.Bool("rr-disable-pd-inserted-events", envOrDefaultBool("RETINA_RR_DISABLE_PD_INSERTED_EVENTS", true), "Disable emitting PD inserted events")
 		rrDisablePeriodDumpEvents     = flag.Bool("rr-disable-period-dump-events", envOrDefaultBool("RETINA_RR_DISABLE_PERIOD_DUMP_EVENTS", true), "Disable emitting period dump events")
 		rrDisableSchedulerLateEvents  = flag.Bool("rr-disable-scheduler-late-events", envOrDefaultBool("RETINA_RR_DISABLE_SCHEDULER_LATE_EVENTS", true), "Disable emitting scheduler late events")
+
+		// --- DDBFIECapturerConfig (capturer- prefix) ---
+		capturerEnabled                 = flag.Bool("capturer-enabled", envOrDefaultBool("RETINA_CAPTURER_ENABLED", true), "Enable capturing FIEs to DuckDB")
+		capturerAllowNonEmptyCaptureDir = flag.Bool("capturer-allow-non-empty-capture-dir", envOrDefaultBool("RETINA_CAPTURER_ALLOW_NON_EMPTY_CAPTURE_DIR", false), "Allow capturing into a non-empty capture directory")
+		capturerBatchSize               = flag.Int("capturer-batch-size", envOrDefaultInt("RETINA_CAPTURER_BATCH_SIZE", 100_000), "Number of FIEs accumulated before flushing DuckDB appenders")
+		capturerCaptureDir              = flag.String("capturer-capture-dir", envOrDefault("RETINA_CAPTURER_CAPTURE_DIR", "./capture"), "Directory where DuckDB FIE capture files are stored")
+		capturerRotationInterval        = flag.Duration("capturer-rotation-interval", envOrDefaultDuration("RETINA_CAPTURER_ROTATION_INTERVAL", 6*time.Hour), "Rotation interval for DuckDB FIE capture files")
+		capturerChannelSize             = flag.Int("capturer-channel-size", envOrDefaultInt("RETINA_CAPTURER_CHANNEL_SIZE", 200_000), "Buffer size of the FIE capture channel")
+		capturerFlushPeriod             = flag.Duration("capturer-flush-period", envOrDefaultDuration("RETINA_CAPTURER_FLUSH_PERIOD", time.Second), "Interval between periodic FIE capturer flushes")
 	)
 	flag.Parse()
 
@@ -105,6 +114,17 @@ func run() error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	var capturerConfig *orchestrator.DDBFIECapturerConfig
+
+	if *capturerEnabled {
+		capturerConfig = &orchestrator.DDBFIECapturerConfig{
+			AllowNonEmptyCaptureDir: *capturerAllowNonEmptyCaptureDir,
+			BatchSize:               *capturerBatchSize,
+			CaptureDir:              *capturerCaptureDir,
+			RotationInterval:        *capturerRotationInterval,
+		}
+	}
 
 	orch, err := orchestrator.NewOrchestrator(&orchestrator.Config{
 		AgentAddress:            *agentAddr,
@@ -145,6 +165,9 @@ func run() error {
 			DisablePeriodDumps:          *rrDisablePeriodDumpEvents,
 			DisableSchedulerLateEvents:  *rrDisableSchedulerLateEvents,
 		},
+		CapturerConfig:      capturerConfig,
+		CaptureChannelSize:  *capturerChannelSize,
+		CapturerFlushPeriod: *capturerFlushPeriod,
 	}, logger, metrics)
 	if err != nil {
 		return err

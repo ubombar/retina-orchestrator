@@ -136,8 +136,8 @@ func (c *ResearchSchedulerConfig) validate() error { //nolint:gocyclo
 	if c.LearningRate <= 0 || c.LearningRate >= 1 {
 		return fmt.Errorf("learning rate (α) must be in (0, 1): %v", c.LearningRate)
 	}
-	if c.SamplingWidth <= 0 || c.SamplingWidth >= 1 {
-		return fmt.Errorf("sampling width (β) must be in (0, 1): %v", c.SamplingWidth)
+	if c.SamplingWidth < 0 || c.SamplingWidth > 1 {
+		return fmt.Errorf("sampling width (β) must be in [0, 1]: %v", c.SamplingWidth)
 	}
 	if c.ImpactThreshold <= 0 {
 		return fmt.Errorf("impact threshold (Λ) must be positive: %v", c.ImpactThreshold)

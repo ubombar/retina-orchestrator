@@ -26,7 +26,7 @@ import (
 // FIECapturer is the interface, the Flush() and Close() methods needs to be
 // idempotent and should not return error when called more than once.
 type FIECapturer interface {
-	Capture(ctx context.Context, seq *SequencedFIE) error
+	Capture(ctx context.Context, fie *api.ForwardingInfoElement) error
 	Flush() error
 	Close() error
 }
@@ -215,8 +215,8 @@ func NewDDBFIECapturer(cfg *DDBFIECapturerConfig) (*DDBFIECapturer, error) {
 	return ddbCap, nil
 }
 
-func (dc *DDBFIECapturer) Capture(ctx context.Context, seq *SequencedFIE) error {
-	if seq == nil {
+func (dc *DDBFIECapturer) Capture(ctx context.Context, fie *api.ForwardingInfoElement) error {
+	if fie == nil {
 		return fmt.Errorf("cannot capture nil FIE")
 	}
 	if err := ctx.Err(); err != nil {
@@ -241,7 +241,7 @@ func (dc *DDBFIECapturer) Capture(ctx context.Context, seq *SequencedFIE) error 
 	}
 
 	// Write to batch and flush if necessary.
-	if err := dc.capture(seq, currentCaptureTime); err != nil {
+	if err := dc.capture(fie, currentCaptureTime); err != nil {
 		return err
 	}
 
@@ -302,8 +302,8 @@ func (dc *DDBFIECapturer) rotate(t time.Time) error {
 	return nil
 }
 
-func (dc *DDBFIECapturer) capture(seq *SequencedFIE, captureTime time.Time) error {
-	compFIE, err := compactFIE(seq, captureTime, dc.cfg.RotationInterval)
+func (dc *DDBFIECapturer) capture(fie *api.ForwardingInfoElement, captureTime time.Time) error {
+	compFIE, err := compactFIE(fie, captureTime, dc.cfg.RotationInterval)
 	if err != nil {
 		return err
 	}
@@ -565,9 +565,7 @@ type compactedFIE struct {
 }
 
 //nolint:funlen,gocyclo
-func compactFIE(seq *SequencedFIE, captureTime time.Time, rotationInterval time.Duration) (compactedFIE, error) {
-	fie := &seq.ForwardingInfoElement
-
+func compactFIE(fie *api.ForwardingInfoElement, captureTime time.Time, rotationInterval time.Duration) (compactedFIE, error) {
 	switch {
 	case fie.Protocol == api.ICMP && fie.IPVersion == api.IPv4:
 	case fie.Protocol == api.ICMPv6 && fie.IPVersion == api.IPv6:
@@ -725,4 +723,37 @@ func createAndCheckCaptureDir(path string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+func validateFIE(fie *api.ForwardingInfoElement) error {
+	if fie == nil {
+		return fmt.Errorf("FIE is nil")
+	}
+
+	if fie.ProbingDirectiveID > math.MaxUint32 {
+		return fmt.Errorf("probing directive ID %d exceeds uint32", fie.ProbingDirectiveID)
+	}
+
+	switch {
+	case fie.Protocol == api.ICMP && fie.IPVersion == api.IPv4:
+	case fie.Protocol == api.ICMPv6 && fie.IPVersion == api.IPv6:
+	case fie.Protocol == api.UDP && fie.IPVersion == api.IPv4:
+	case fie.Protocol == api.UDP && fie.IPVersion == api.IPv6:
+	default:
+		return fmt.Errorf("unsupported protocol/IP combination: protocol=%d ip_version=%d", fie.Protocol, fie.IPVersion)
+	}
+
+	if fie.NearInfo != nil {
+		if _, err := compactIP(fie.NearInfo.ReplyAddress, fie.IPVersion); err != nil {
+			return fmt.Errorf("invalid near reply address: %w", err)
+		}
+	}
+
+	if fie.FarInfo != nil {
+		if _, err := compactIP(fie.FarInfo.ReplyAddress, fie.IPVersion); err != nil {
+			return fmt.Errorf("invalid far reply address: %w", err)
+		}
+	}
+
+	return nil
 }

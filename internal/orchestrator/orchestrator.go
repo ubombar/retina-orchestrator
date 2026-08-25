@@ -53,6 +53,10 @@ type Config struct {
 	StreamStartFromEarliest bool `json:"stream_start_from_earliest"`
 
 	ResearchSchedulerConfig *ResearchSchedulerConfig `json:"research_scheduler_config"`
+
+	CapturerConfig      *DDBFIECapturerConfig `json:"capturer_config"`
+	CaptureChannelSize  int                   `json:"capture_channel_size"`
+	CapturerFlushPeriod time.Duration         `json:"capturer_flush_period"`
 }
 
 // Validate checks all configuration fields and applies defaults where appropriate.
@@ -60,6 +64,12 @@ type Config struct {
 func (c *Config) Validate() error {
 	if c.AgentAddress == "" {
 		return fmt.Errorf("AgentAddress cannot be empty")
+	}
+	if c.CaptureChannelSize < 0 {
+		return fmt.Errorf("CaptureChannelSize cannot be negative: got %d", c.CaptureChannelSize)
+	}
+	if c.CapturerFlushPeriod < time.Second {
+		return fmt.Errorf("CapturerFlushPeriod cannot be smaller than a second: got %d", c.CapturerFlushPeriod)
 	}
 	if c.AgentBufferLength < 8192 {
 		return fmt.Errorf("AgentBufferLength is too small: got %d, minimum 8192", c.AgentBufferLength)
@@ -95,6 +105,8 @@ type Orchestrator struct {
 	pdQueue       *structures.Queue[api.ProbingDirective]
 	fieRingBuffer *structures.RingBuffer[api.ForwardingInfoElement]
 	ebus          *EventBus
+	capturer      FIECapturer
+	captureCh     chan *api.ForwardingInfoElement
 }
 
 // NewOrchestrator creates a new orchestrator from the given configuration.
@@ -174,6 +186,15 @@ func NewOrchestrator(config *Config, logger *slog.Logger, metrics *Metrics) (*Or
 	}
 	o.apiServer = apiServer
 
+	if config.CapturerConfig != nil {
+		capturer, err := NewDDBFIECapturer(config.CapturerConfig)
+		if err != nil {
+			return nil, err
+		}
+		o.capturer = capturer
+		o.captureCh = make(chan *api.ForwardingInfoElement, config.CaptureChannelSize)
+	}
+
 	return o, nil
 }
 
@@ -189,6 +210,9 @@ func (o *Orchestrator) Run(parentCtx context.Context) error {
 		return o.runScheduler(ctx)
 	})
 	group.Go(func() error {
+		return o.runCapturer(ctx)
+	})
+	group.Go(func() error {
 		<-ctx.Done()
 		return o.scheduler.Close()
 	})
@@ -196,6 +220,64 @@ func (o *Orchestrator) Run(parentCtx context.Context) error {
 	err := group.Wait()
 
 	return err
+}
+
+//nolint:gocyclo
+func (o *Orchestrator) runCapturer(ctx context.Context) error {
+	if o.capturer == nil {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	group, ctx := errgroup.WithContext(ctx)
+
+	group.Go(func() error {
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+
+			case fie, ok := <-o.captureCh:
+				if !ok {
+					return nil
+				}
+
+				if err := o.capturer.Capture(ctx, fie); err != nil {
+					return err
+				}
+			}
+		}
+	})
+
+	group.Go(func() error {
+		ticker := time.NewTicker(o.config.CapturerFlushPeriod)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+
+			case <-ticker.C:
+				if err := o.capturer.Flush(); err != nil {
+					return err
+				}
+			}
+		}
+	})
+
+	err := group.Wait()
+
+	// Flush anything remaining below the configured batch size.
+	if flushErr := o.capturer.Flush(); flushErr != nil && (err == nil || errors.Is(err, ctx.Err())) {
+		return flushErr
+	}
+
+	if err != nil && !errors.Is(err, ctx.Err()) {
+		return err
+	}
+
+	return nil
 }
 
 func (o *Orchestrator) runScheduler(ctx context.Context) error {
@@ -347,7 +429,7 @@ func (o *Orchestrator) insertAfterHandler(pds []*api.ProbingDirective) {
 	})
 }
 
-//nolint:funlen
+//nolint:funlen,gocyclo
 func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 	consumer, err := o.pdQueue.NewConsumer(status.agentID)
 	if err != nil {
@@ -396,6 +478,20 @@ func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 				continue
 			}
 
+			// Before pushing to the ring buffer capture the fie.
+			if o.capturer != nil {
+				if err := validateFIE(fie); err == nil {
+					if err := o.capturer.Capture(ctx, fie); err != nil {
+						return err
+					}
+				} else {
+					o.logger.Warn("Invalid FIE, skipping capturing",
+						slog.String("agent_id", status.agentID),
+						slog.Uint64("pd_id", fie.ProbingDirectiveID),
+						slog.Bool("complete", fie.NearInfo != nil && fie.FarInfo != nil),
+						slog.String("error", err.Error()))
+				}
+			}
 			_ = o.fieRingBuffer.Push(fie)
 		}
 	})
