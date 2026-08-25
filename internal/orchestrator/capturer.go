@@ -23,15 +23,15 @@ import (
 	"github.com/marcboeker/go-duckdb/v2"
 )
 
-// Capturer is the interface, the Flush() and Close() methods needs to be
+// FIECapturer is the interface, the Flush() and Close() methods needs to be
 // idempotent and should not return error when called more than once.
-type Capturer interface {
+type FIECapturer interface {
 	Capture(ctx context.Context, seq *SequencedFIE) error
 	Flush() error
 	Close() error
 }
 
-// DDBCapturer implements Capturer using DuckDB with a compact representation
+// DDBFIECapturer implements Capturer using DuckDB with a compact representation
 // optimized for storage.
 //
 // The full FIE is not stored. Fields that can be reconstructed from the
@@ -159,14 +159,14 @@ type Capturer interface {
 //     fies-20260824T120000Z.duckdb
 //   - Rotation keeps files small enough to copy elsewhere and reclaim local
 //     disk space during long experiments.
-type DDBCapturer struct {
+type DDBFIECapturer struct {
 	currentIntervalHandle *captureHandle
 	closed                bool
 	mu                    sync.Mutex
-	cfg                   DDBCapturerConfig
+	cfg                   DDBFIECapturerConfig
 }
 
-type DDBCapturerConfig struct {
+type DDBFIECapturerConfig struct {
 	// AllowNonEmptyCaptureDir if set to false would give an error in case there
 	// are existing files in the capture directory.
 	AllowNonEmptyCaptureDir bool `json:"allow_non_empty_capture_dir"`
@@ -179,7 +179,7 @@ type DDBCapturerConfig struct {
 	RotationInterval time.Duration `json:"rotation_interval"`
 }
 
-func validateConfig(cfg *DDBCapturerConfig) error {
+func validateConfig(cfg *DDBFIECapturerConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("given config is nil")
 	}
@@ -205,17 +205,17 @@ func validateConfig(cfg *DDBCapturerConfig) error {
 	return nil
 }
 
-func NewDDBCapturer(cfg *DDBCapturerConfig) (*DDBCapturer, error) {
+func NewDDBFIECapturer(cfg *DDBFIECapturerConfig) (*DDBFIECapturer, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, fmt.Errorf("cannot create DDBCapturer: %w", err)
 	}
-	ddbCap := &DDBCapturer{
+	ddbCap := &DDBFIECapturer{
 		cfg: *cfg,
 	}
 	return ddbCap, nil
 }
 
-func (dc *DDBCapturer) Capture(ctx context.Context, seq *SequencedFIE) error {
+func (dc *DDBFIECapturer) Capture(ctx context.Context, seq *SequencedFIE) error {
 	if seq == nil {
 		return fmt.Errorf("cannot capture nil FIE")
 	}
@@ -248,19 +248,19 @@ func (dc *DDBCapturer) Capture(ctx context.Context, seq *SequencedFIE) error {
 	return nil
 }
 
-func (dc *DDBCapturer) Flush() error {
+func (dc *DDBFIECapturer) Flush() error {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	return dc.flush()
 }
 
-func (dc *DDBCapturer) Close() error {
+func (dc *DDBFIECapturer) Close() error {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	return dc.close()
 }
 
-func (dc *DDBCapturer) flush() error {
+func (dc *DDBFIECapturer) flush() error {
 	if dc.closed {
 		return nil
 	}
@@ -270,7 +270,7 @@ func (dc *DDBCapturer) flush() error {
 	return dc.currentIntervalHandle.flush()
 }
 
-func (dc *DDBCapturer) close() error {
+func (dc *DDBFIECapturer) close() error {
 	if dc.closed {
 		return nil
 	}
@@ -286,7 +286,7 @@ func (dc *DDBCapturer) close() error {
 	return handle.close()
 }
 
-func (dc *DDBCapturer) rotate(t time.Time) error {
+func (dc *DDBFIECapturer) rotate(t time.Time) error {
 	if dc.currentIntervalHandle != nil {
 		old := dc.currentIntervalHandle
 		if err := old.close(); err != nil {
@@ -302,7 +302,7 @@ func (dc *DDBCapturer) rotate(t time.Time) error {
 	return nil
 }
 
-func (dc *DDBCapturer) capture(seq *SequencedFIE, captureTime time.Time) error {
+func (dc *DDBFIECapturer) capture(seq *SequencedFIE, captureTime time.Time) error {
 	compFIE, err := compactFIE(seq, captureTime, dc.cfg.RotationInterval)
 	if err != nil {
 		return err
