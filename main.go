@@ -167,9 +167,10 @@ func run() error {
 			DisablePeriodDumps:          *rrDisablePeriodDumpEvents,
 			DisableSchedulerLateEvents:  *rrDisableSchedulerLateEvents,
 		},
-		CapturerConfig:      capturerConfig,
-		CaptureChannelSize:  *capturerChannelSize,
-		CapturerFlushPeriod: *capturerFlushPeriod,
+		CapturerConfig:        capturerConfig,
+		CaptureChannelSize:    *capturerChannelSize,
+		CapturerFlushPeriod:   *capturerFlushPeriod,
+		EventRotationInterval: *capturerRotationInterval, // make sure event and fies have the same rotation interval
 	}, logger, metrics)
 	if err != nil {
 		return err
