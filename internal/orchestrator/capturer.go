@@ -35,7 +35,8 @@ type FIECapturer interface {
 // optimized for storage.
 //
 // The full FIE is not stored. Fields that can be reconstructed from the
-// corresponding ProbingDirective are omitted. Each stored FIE contains only:
+// corresponding ProbingDirective or other capture metadata are omitted. Each
+// stored FIE contains only:
 //
 //   - probing_directive_id:
 //
@@ -55,24 +56,10 @@ type FIECapturer interface {
 //     The absolute capture timestamp is reconstructed from the interval start
 //     encoded in the database filename plus capture_second.
 //
-//   - capture_order:
-//
-//     Stored as USMALLINT/uint16 and contains the lower 16 bits of the FIE's
-//     capture order within capture_second. The upper 2 bits are stored in
-//     time_deltas bits 30..31, giving an 18-bit order.
-//
-//     The full capture order is reconstructed as:
-//
-//     uint32(capture_order) | (((time_deltas >> 30) & 0x3) << 16)
-//
-//     Values above 262143 are saturated to 262143. Ordering is therefore exact
-//     within a capture_second up to that value.
-//
 //   - time_deltas:
 //
 //     Five timestamps are represented as 6-bit second-resolution deltas and
-//     packed into bits 0..29 of a UINTEGER/uint32. Bits 30..31 store the upper
-//     two bits of capture_order.
+//     packed into bits 0..29 of a UINTEGER/uint32. Bits 30..31 are reserved.
 //
 //     All timestamps are encoded relative to the capturer's local capture time:
 //
@@ -81,7 +68,7 @@ type FIECapturer interface {
 //     bits 12..17  near received -> capture
 //     bits 18..23  far sent -> capture
 //     bits 24..29  far received -> capture
-//     bits 30..31  capture_order bits 16..17
+//     bits 30..31  reserved
 //
 //     Each 6-bit delta uses the following encoding:
 //
@@ -110,34 +97,36 @@ type FIECapturer interface {
 //
 //   - reply addresses:
 //
-//     Near and far reply addresses are nullable BLOBs. Records are separated
-//     by protocol and IP version so IPv4 addresses use exactly 4 bytes and IPv6
-//     addresses use exactly 16 bytes.
+//     Near and far reply addresses are nullable BLOBs. IPv4 addresses are
+//     stored using exactly 4 bytes and IPv6 addresses using exactly 16 bytes.
+//     The expected address size is determined from the IP version of the
+//     associated ProbingDirective.
 //
 // Table layout:
 //
-//   - fies_icmpv4:
-//     ICMP over IPv4.
+//   - fies:
 //
-//   - fies_icmpv6:
-//     ICMPv6 over IPv6.
+//     All captured FIEs are stored in a single table. Protocol and IP version
+//     are not stored in each row because both are reconstructed from the
+//     associated ProbingDirective.
 //
-//   - fies_udpv4:
-//     UDP over IPv4.
+//     The table contains:
 //
-//   - fies_udpv6:
-//     UDP over IPv6.
+//     probing_directive_id UINTEGER NOT NULL
+//     near_reply_address   BLOB
+//     far_reply_address    BLOB
+//     capture_second       USMALLINT NOT NULL
+//     time_deltas          UINTEGER NOT NULL
 //
-//     The table name therefore encodes both the protocol and IP version, so
-//     neither field needs to be stored in every FIE row.
-//
-//     ICMP over IPv6 and ICMPv6 over IPv4 are considered invalid combinations
-//     and are rejected.
+//     FIEs are appended to this table in capture order. DuckDB insertion-order
+//     preservation is relied upon when extracting rows so that the original
+//     global FIE ordering can be reconstructed. The extractor assigns sequence
+//     numbers monotonically as rows are read across consecutive rotation files.
 //
 // The following fields are intentionally not stored because they can be
-// reconstructed from the associated ProbingDirective, table name, capture
-// metadata, or agent metadata: agent ID, source address, destination address,
-// IP version, protocol, near TTL, and far TTL.
+// reconstructed from the associated ProbingDirective, capture metadata, or
+// agent metadata: agent ID, source address, destination address, IP version,
+// protocol, near TTL, far TTL, and sequence number.
 //
 // Clock assumptions:
 //
@@ -320,19 +309,7 @@ func (dc *DDBFIECapturer) rotate(t time.Time) error {
 func (dc *DDBFIECapturer) capture(fie *api.ForwardingInfoElement, captureTime time.Time) error {
 	h := dc.currentIntervalHandle
 
-	// #nosec G115 -- captureSecond is bounded by RotationInterval, which is validated to be <= 18h,
-	// so the maximum value is 64799 and always fits in uint16.
-	captureSecond := uint16(captureTime.UTC().Unix() - captureTime.UTC().Truncate(dc.cfg.RotationInterval).Unix())
-
-	if captureSecond != h.lastCaptureSecond {
-		h.lastCaptureSecond = captureSecond
-		h.nextCaptureOrder = 0
-	}
-
-	const maxCaptureOrder uint32 = (1 << 18) - 1
-	captureOrder := min(h.nextCaptureOrder, maxCaptureOrder)
-
-	compFIE, err := compactFIE(fie, captureTime, dc.cfg.RotationInterval, captureOrder)
+	compFIE, err := compactFIE(fie, captureTime, dc.cfg.RotationInterval)
 	if err != nil {
 		return err
 	}
@@ -340,8 +317,6 @@ func (dc *DDBFIECapturer) capture(fie *api.ForwardingInfoElement, captureTime ti
 	if err := h.append(compFIE); err != nil {
 		return err
 	}
-
-	h.nextCaptureOrder++
 
 	if h.pending >= dc.cfg.BatchSize {
 		if err := h.flush(); err != nil {
@@ -353,19 +328,12 @@ func (dc *DDBFIECapturer) capture(fie *api.ForwardingInfoElement, captureTime ti
 }
 
 type captureHandle struct {
-	interval  time.Time
-	db        *sql.DB
-	connector *duckdb.Connector
-	conn      driver.Conn
-	pending   int
-
-	lastCaptureSecond uint16
-	nextCaptureOrder  uint32
-
-	icmpv4 *duckdb.Appender
-	icmpv6 *duckdb.Appender
-	udpv4  *duckdb.Appender
-	udpv6  *duckdb.Appender
+	interval     time.Time
+	db           *sql.DB
+	connector    *duckdb.Connector
+	conn         driver.Conn
+	pending      int
+	fiesAppender *duckdb.Appender
 }
 
 // openCaptureHandle creates a new handler from the given time. Given time t is
@@ -382,40 +350,18 @@ func openCaptureHandle(t time.Time, captureDir string) (*captureHandle, error) {
 
 	db := sql.OpenDB(connector)
 
+	if _, err := db.Exec("SET preserve_insertion_order = true"); err != nil {
+		_ = db.Close()
+		_ = connector.Close()
+		return nil, fmt.Errorf("enable insertion-order preservation: %w", err)
+	}
+
 	const ddl = `
-CREATE TABLE IF NOT EXISTS fies_icmpv4 (
+CREATE TABLE IF NOT EXISTS fies (
     probing_directive_id UINTEGER NOT NULL,
     near_reply_address   BLOB,
     far_reply_address    BLOB,
     capture_second       USMALLINT NOT NULL,
-    capture_order        USMALLINT NOT NULL,
-    time_deltas          UINTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS fies_icmpv6 (
-    probing_directive_id UINTEGER NOT NULL,
-    near_reply_address   BLOB,
-    far_reply_address    BLOB,
-    capture_second       USMALLINT NOT NULL,
-    capture_order        USMALLINT NOT NULL,
-    time_deltas          UINTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS fies_udpv4 (
-    probing_directive_id UINTEGER NOT NULL,
-    near_reply_address   BLOB,
-    far_reply_address    BLOB,
-    capture_second       USMALLINT NOT NULL,
-    capture_order        USMALLINT NOT NULL,
-    time_deltas          UINTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS fies_udpv6 (
-    probing_directive_id UINTEGER NOT NULL,
-    near_reply_address   BLOB,
-    far_reply_address    BLOB,
-    capture_second       USMALLINT NOT NULL,
-    capture_order        USMALLINT NOT NULL,
     time_deltas          UINTEGER NOT NULL
 );
 `
@@ -433,82 +379,29 @@ CREATE TABLE IF NOT EXISTS fies_udpv6 (
 		return nil, fmt.Errorf("connect: %w", err)
 	}
 
-	icmpv4, err := duckdb.NewAppenderFromConn(conn, "", "fies_icmpv4")
+	fiesAppender, err := duckdb.NewAppenderFromConn(conn, "", "fies")
 	if err != nil {
 		_ = conn.Close()
 		_ = db.Close()
 		_ = connector.Close()
-		return nil, fmt.Errorf("create ICMPv4 appender: %w", err)
-	}
-
-	icmpv6, err := duckdb.NewAppenderFromConn(conn, "", "fies_icmpv6")
-	if err != nil {
-		_ = icmpv4.Close()
-		_ = conn.Close()
-		_ = db.Close()
-		_ = connector.Close()
-		return nil, fmt.Errorf("create ICMPv6 appender: %w", err)
-	}
-
-	udpv4, err := duckdb.NewAppenderFromConn(conn, "", "fies_udpv4")
-	if err != nil {
-		_ = icmpv6.Close()
-		_ = icmpv4.Close()
-		_ = conn.Close()
-		_ = db.Close()
-		_ = connector.Close()
-		return nil, fmt.Errorf("create UDPv4 appender: %w", err)
-	}
-
-	udpv6, err := duckdb.NewAppenderFromConn(conn, "", "fies_udpv6")
-	if err != nil {
-		_ = udpv4.Close()
-		_ = icmpv6.Close()
-		_ = icmpv4.Close()
-		_ = conn.Close()
-		_ = db.Close()
-		_ = connector.Close()
-		return nil, fmt.Errorf("create UDPv6 appender: %w", err)
+		return nil, fmt.Errorf("create FIE appender: %w", err)
 	}
 
 	return &captureHandle{
-		interval:  t,
-		db:        db,
-		connector: connector,
-		conn:      conn,
-		icmpv4:    icmpv4,
-		icmpv6:    icmpv6,
-		udpv4:     udpv4,
-		udpv6:     udpv6,
+		interval:     t,
+		db:           db,
+		connector:    connector,
+		conn:         conn,
+		fiesAppender: fiesAppender,
 	}, nil
 }
 
 func (f *captureHandle) append(row compactedFIE) error {
-	var appender *duckdb.Appender
-
-	switch {
-	case row.protocol == api.ICMP && row.isIPv4:
-		appender = f.icmpv4
-
-	case row.protocol == api.ICMPv6 && !row.isIPv4:
-		appender = f.icmpv6
-
-	case row.protocol == api.UDP && row.isIPv4:
-		appender = f.udpv4
-
-	case row.protocol == api.UDP && !row.isIPv4:
-		appender = f.udpv6
-
-	default:
-		return fmt.Errorf("unsupported protocol/IP combination: protocol=%d is_ipv4=%t", row.protocol, row.isIPv4)
-	}
-
-	if err := appender.AppendRow(
+	if err := f.fiesAppender.AppendRow(
 		row.pdID,
 		row.nearReply,
 		row.farReply,
 		row.captureSecond,
-		row.captureOrder,
 		row.timeDeltas,
 	); err != nil {
 		return fmt.Errorf("append row: %w", err)
@@ -518,25 +411,14 @@ func (f *captureHandle) append(row compactedFIE) error {
 	return nil
 }
 
+// flush flushes the appended records.
 func (f *captureHandle) flush() error {
 	if f.pending == 0 {
 		return nil
 	}
 
-	if err := f.icmpv4.Flush(); err != nil {
-		return fmt.Errorf("flush ICMPv4 appender: %w", err)
-	}
-
-	if err := f.icmpv6.Flush(); err != nil {
-		return fmt.Errorf("flush ICMPv6 appender: %w", err)
-	}
-
-	if err := f.udpv4.Flush(); err != nil {
-		return fmt.Errorf("flush UDPv4 appender: %w", err)
-	}
-
-	if err := f.udpv6.Flush(); err != nil {
-		return fmt.Errorf("flush UDPv6 appender: %w", err)
+	if err := f.fiesAppender.Flush(); err != nil {
+		return fmt.Errorf("flush FIE appender: %w", err)
 	}
 
 	f.pending = 0
@@ -554,24 +436,9 @@ func (f *captureHandle) close() error {
 
 	record(f.flush())
 
-	if f.icmpv4 != nil {
-		record(f.icmpv4.Close())
-		f.icmpv4 = nil
-	}
-
-	if f.icmpv6 != nil {
-		record(f.icmpv6.Close())
-		f.icmpv6 = nil
-	}
-
-	if f.udpv4 != nil {
-		record(f.udpv4.Close())
-		f.udpv4 = nil
-	}
-
-	if f.udpv6 != nil {
-		record(f.udpv6.Close())
-		f.udpv6 = nil
+	if f.fiesAppender != nil {
+		record(f.fiesAppender.Close())
+		f.fiesAppender = nil
 	}
 
 	if f.conn != nil {
@@ -601,35 +468,13 @@ type compactedFIE struct {
 	nearReply     []byte
 	farReply      []byte
 	captureSecond uint16
-	captureOrder  uint16
 	timeDeltas    uint32
-	isIPv4        bool
-	protocol      api.Protocol
 }
 
 //nolint:funlen,gocyclo
-func compactFIE(fie *api.ForwardingInfoElement, captureTime time.Time, rotationInterval time.Duration, captureOrder uint32) (compactedFIE, error) {
-	switch {
-	case fie.Protocol == api.ICMP && fie.IPVersion == api.IPv4:
-	case fie.Protocol == api.ICMPv6 && fie.IPVersion == api.IPv6:
-	case fie.Protocol == api.UDP && fie.IPVersion == api.IPv4:
-	case fie.Protocol == api.UDP && fie.IPVersion == api.IPv6:
-	default:
-		return compactedFIE{}, fmt.Errorf("unsupported protocol/IP combination: protocol=%d ip_version=%d", fie.Protocol, fie.IPVersion)
-	}
-
+func compactFIE(fie *api.ForwardingInfoElement, captureTime time.Time, rotationInterval time.Duration) (compactedFIE, error) {
 	if fie.ProbingDirectiveID > math.MaxUint32 {
 		return compactedFIE{}, fmt.Errorf("probing directive ID %d exceeds uint32", fie.ProbingDirectiveID)
-	}
-
-	var isIPv4 bool
-	switch fie.IPVersion {
-	case api.IPv4:
-		isIPv4 = true
-	case api.IPv6:
-		isIPv4 = false
-	default:
-		return compactedFIE{}, fmt.Errorf("unsupported IP version %d", fie.IPVersion)
 	}
 
 	captureTime = captureTime.UTC()
@@ -652,7 +497,7 @@ func compactFIE(fie *api.ForwardingInfoElement, captureTime time.Time, rotationI
 
 	if fie.NearInfo != nil {
 		var err error
-		nearReply, err = compactIP(fie.NearInfo.ReplyAddress, fie.IPVersion)
+		nearReply, err = compactIP(fie.NearInfo.ReplyAddress)
 		if err != nil {
 			return compactedFIE{}, fmt.Errorf("near reply: %w", err)
 		}
@@ -662,7 +507,7 @@ func compactFIE(fie *api.ForwardingInfoElement, captureTime time.Time, rotationI
 
 	if fie.FarInfo != nil {
 		var err error
-		farReply, err = compactIP(fie.FarInfo.ReplyAddress, fie.IPVersion)
+		farReply, err = compactIP(fie.FarInfo.ReplyAddress)
 		if err != nil {
 			return compactedFIE{}, fmt.Errorf("far reply: %w", err)
 		}
@@ -672,25 +517,18 @@ func compactFIE(fie *api.ForwardingInfoElement, captureTime time.Time, rotationI
 
 	productionDelta := timestampDelta(captureTime, fie.ProductionTimestamp)
 
-	captureOrderLow := uint16(captureOrder & 0xffff)
-	captureOrderHigh := (captureOrder >> 16) & 0x3
-
 	timeDeltas := uint32(productionDelta) |
 		uint32(nearSentDelta)<<6 |
 		uint32(nearRecvDelta)<<12 |
 		uint32(farSentDelta)<<18 |
-		uint32(farRecvDelta)<<24 |
-		captureOrderHigh<<30
+		uint32(farRecvDelta)<<24
 
 	return compactedFIE{
 		pdID:          uint32(fie.ProbingDirectiveID),
 		nearReply:     nearReply,
 		farReply:      farReply,
 		captureSecond: uint16(captureSeconds),
-		captureOrder:  captureOrderLow,
 		timeDeltas:    timeDeltas,
-		isIPv4:        isIPv4,
-		protocol:      fie.Protocol,
 	}, nil
 }
 
@@ -710,36 +548,23 @@ func timestampDelta(reference, timestamp time.Time) uint8 {
 	return uint8(delta)
 }
 
-func compactIP(ip net.IP, version api.IPVersion) ([]byte, error) {
-	if ip == nil {
+func compactIP(ip net.IP) ([]byte, error) {
+	if ip == nil || ip.IsUnspecified() {
 		return nil, nil
 	}
 
-	switch version {
-	case api.IPv4:
-		v4 := ip.To4()
-		if v4 == nil {
-			return nil, fmt.Errorf("expected IPv4 address, got %v", ip)
-		}
-
+	if v4 := ip.To4(); v4 != nil {
 		return []byte{v4[0], v4[1], v4[2], v4[3]}, nil
-
-	case api.IPv6:
-		// If the type is IPv6 but the form is IPv4 (mapped into IPv6) then we
-		// will still allow since this might happen. In that case we will encode
-		// the address as IPv6 mapped IPv4.
-		v6 := ip.To16()
-		if v6 == nil {
-			return nil, fmt.Errorf("invalid IPv6 address %v", ip)
-		}
-
-		out := make([]byte, net.IPv6len)
-		copy(out, v6)
-		return out, nil
-
-	default:
-		return nil, fmt.Errorf("unsupported IP version %d", version)
 	}
+
+	v6 := ip.To16()
+	if v6 == nil {
+		return nil, fmt.Errorf("invalid IP address %v", ip)
+	}
+
+	out := make([]byte, net.IPv6len)
+	copy(out, v6)
+	return out, nil
 }
 
 func timeToFilename(t time.Time) string {
@@ -767,37 +592,4 @@ func createAndCheckCaptureDir(path string) (bool, error) {
 	}
 
 	return false, nil
-}
-
-func validateFIE(fie *api.ForwardingInfoElement) error {
-	if fie == nil {
-		return fmt.Errorf("FIE is nil")
-	}
-
-	if fie.ProbingDirectiveID > math.MaxUint32 {
-		return fmt.Errorf("probing directive ID %d exceeds uint32", fie.ProbingDirectiveID)
-	}
-
-	switch {
-	case fie.Protocol == api.ICMP && fie.IPVersion == api.IPv4:
-	case fie.Protocol == api.ICMPv6 && fie.IPVersion == api.IPv6:
-	case fie.Protocol == api.UDP && fie.IPVersion == api.IPv4:
-	case fie.Protocol == api.UDP && fie.IPVersion == api.IPv6:
-	default:
-		return fmt.Errorf("unsupported protocol/IP combination: protocol=%d ip_version=%d", fie.Protocol, fie.IPVersion)
-	}
-
-	if fie.NearInfo != nil {
-		if _, err := compactIP(fie.NearInfo.ReplyAddress, fie.IPVersion); err != nil {
-			return fmt.Errorf("invalid near reply address: %w", err)
-		}
-	}
-
-	if fie.FarInfo != nil {
-		if _, err := compactIP(fie.FarInfo.ReplyAddress, fie.IPVersion); err != nil {
-			return fmt.Errorf("invalid far reply address: %w", err)
-		}
-	}
-
-	return nil
 }

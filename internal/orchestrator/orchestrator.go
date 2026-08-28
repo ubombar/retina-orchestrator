@@ -487,16 +487,8 @@ func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 
 			// Before pushing to the ring buffer capture the fie.
 			if o.capturer != nil {
-				if err := validateFIE(fie); err == nil {
-					if err := o.capturer.Capture(ctx, fie); err != nil {
-						return err
-					}
-				} else {
-					o.logger.Warn("Invalid FIE, skipping capturing",
-						slog.String("agent_id", status.agentID),
-						slog.Uint64("pd_id", fie.ProbingDirectiveID),
-						slog.Bool("complete", fie.NearInfo != nil && fie.FarInfo != nil),
-						slog.String("error", err.Error()))
+				if err := o.capturer.Capture(ctx, fie); err != nil {
+					return err
 				}
 			}
 			_ = o.fieRingBuffer.Push(fie)
