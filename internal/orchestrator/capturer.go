@@ -38,10 +38,12 @@ type FIECapturer interface {
 // corresponding ProbingDirective are omitted. Each stored FIE contains only:
 //
 //   - probing_directive_id:
+//
 //     Stored as UINTEGER/uint32. In the expected dataset PD IDs are bounded
 //     by max(uint32) = 4294967295.
 //
 //   - capture_second:
+//
 //     Stored as USMALLINT/uint16. Each DuckDB file represents one configured
 //     UTC rotation interval. The value is the number of whole seconds between
 //     the beginning of the file's interval and the time at which the FIE was
@@ -53,10 +55,24 @@ type FIECapturer interface {
 //     The absolute capture timestamp is reconstructed from the interval start
 //     encoded in the database filename plus capture_second.
 //
+//   - capture_order:
+//
+//     Stored as USMALLINT/uint16 and contains the lower 16 bits of the FIE's
+//     capture order within capture_second. The upper 2 bits are stored in
+//     time_deltas bits 30..31, giving an 18-bit order.
+//
+//     The full capture order is reconstructed as:
+//
+//     uint32(capture_order) | (((time_deltas >> 30) & 0x3) << 16)
+//
+//     Values above 262143 are saturated to 262143. Ordering is therefore exact
+//     within a capture_second up to that value.
+//
 //   - time_deltas:
+//
 //     Five timestamps are represented as 6-bit second-resolution deltas and
-//     packed into a UINTEGER/uint32. This requires 30 bits, leaving bits 30..31
-//     reserved.
+//     packed into bits 0..29 of a UINTEGER/uint32. Bits 30..31 store the upper
+//     two bits of capture_order.
 //
 //     All timestamps are encoded relative to the capturer's local capture time:
 //
@@ -65,13 +81,12 @@ type FIECapturer interface {
 //     bits 12..17  near received -> capture
 //     bits 18..23  far sent -> capture
 //     bits 24..29  far received -> capture
-//     bits 30..31  reserved
+//     bits 30..31  capture_order bits 16..17
 //
 //     Each 6-bit delta uses the following encoding:
 //
-//     0..61 = that many whole seconds before the capture timestamp
-//     62    = 62 or more seconds before the capture timestamp
-//     63    = nil / unknown / timestamp after the capture timestamp
+//     0..62 = that many whole seconds before the capture timestamp
+//     63    = nil / unknown / >= 63 seconds before capture / after capture
 //
 //     For any timestamp T:
 //
@@ -84,8 +99,8 @@ type FIECapturer interface {
 //     independent. In particular, probe timestamps can still be represented
 //     even when the production timestamp is missing.
 //
-//     When both the production timestamp and a probe timestamp are available
-//     and neither delta is saturated, their relative timing can be reconstructed:
+//     When both the production timestamp and a probe timestamp are available,
+//     their relative timing can be reconstructed:
 //
 //     production_time - probe_time
 //     = probe_delta - production_delta
@@ -94,6 +109,7 @@ type FIECapturer interface {
 //     rotation and timestamp reconstruction.
 //
 //   - reply addresses:
+//
 //     Near and far reply addresses are nullable BLOBs. Records are separated
 //     by protocol and IP version so IPv4 addresses use exactly 4 bytes and IPv6
 //     addresses use exactly 16 bytes.
@@ -119,9 +135,9 @@ type FIECapturer interface {
 //     and are rejected.
 //
 // The following fields are intentionally not stored because they can be
-// reconstructed from the associated ProbingDirective, table name, or other
-// metadata: agent ID, source address, destination address, IP version, protocol,
-// near TTL, far TTL, and sequence number.
+// reconstructed from the associated ProbingDirective, table name, capture
+// metadata, or agent metadata: agent ID, source address, destination address,
+// IP version, protocol, near TTL, and far TTL.
 //
 // Clock assumptions:
 //
@@ -138,12 +154,11 @@ type FIECapturer interface {
 //     agent clock, so their relative deltas are not affected by a constant
 //     clock offset between the agent and capturer.
 //   - Timestamp deltas are represented with 6 bits. Exact values are retained
-//     for deltas from 0 to 61 seconds before the capture timestamp.
-//   - A delta of 62 represents any timestamp that occurred 62 seconds or more
-//     before the capture timestamp.
-//   - A delta of 63 represents an unknown/missing timestamp or a timestamp that
-//     is after the capture timestamp. The latter is treated as invalid timing
-//     data, typically caused by clock skew or unexpected timestamp ordering.
+//     for deltas from 0 to 62 seconds before the capture timestamp.
+//   - A delta of 63 represents an unknown/missing timestamp, a timestamp that
+//     occurred 63 seconds or more before capture, or a timestamp after capture.
+//   - A timestamp after capture is treated as invalid timing data, typically
+//     caused by clock skew or unexpected timestamp ordering.
 //
 // Storage assumptions / operational design:
 //
@@ -303,18 +318,37 @@ func (dc *DDBFIECapturer) rotate(t time.Time) error {
 }
 
 func (dc *DDBFIECapturer) capture(fie *api.ForwardingInfoElement, captureTime time.Time) error {
-	compFIE, err := compactFIE(fie, captureTime, dc.cfg.RotationInterval)
+	h := dc.currentIntervalHandle
+
+	// #nosec G115 -- captureSecond is bounded by RotationInterval, which is validated to be <= 18h,
+	// so the maximum value is 64799 and always fits in uint16.
+	captureSecond := uint16(captureTime.UTC().Unix() - captureTime.UTC().Truncate(dc.cfg.RotationInterval).Unix())
+
+	if captureSecond != h.lastCaptureSecond {
+		h.lastCaptureSecond = captureSecond
+		h.nextCaptureOrder = 0
+	}
+
+	const maxCaptureOrder uint32 = (1 << 18) - 1
+	captureOrder := min(h.nextCaptureOrder, maxCaptureOrder)
+
+	compFIE, err := compactFIE(fie, captureTime, dc.cfg.RotationInterval, captureOrder)
 	if err != nil {
 		return err
 	}
-	if err := dc.currentIntervalHandle.append(compFIE); err != nil {
+
+	if err := h.append(compFIE); err != nil {
 		return err
 	}
-	if dc.currentIntervalHandle.pending >= dc.cfg.BatchSize {
-		if err := dc.currentIntervalHandle.flush(); err != nil {
+
+	h.nextCaptureOrder++
+
+	if h.pending >= dc.cfg.BatchSize {
+		if err := h.flush(); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -324,6 +358,9 @@ type captureHandle struct {
 	connector *duckdb.Connector
 	conn      driver.Conn
 	pending   int
+
+	lastCaptureSecond uint16
+	nextCaptureOrder  uint32
 
 	icmpv4 *duckdb.Appender
 	icmpv6 *duckdb.Appender
@@ -351,6 +388,7 @@ CREATE TABLE IF NOT EXISTS fies_icmpv4 (
     near_reply_address   BLOB,
     far_reply_address    BLOB,
     capture_second       USMALLINT NOT NULL,
+    capture_order        USMALLINT NOT NULL,
     time_deltas          UINTEGER NOT NULL
 );
 
@@ -359,6 +397,7 @@ CREATE TABLE IF NOT EXISTS fies_icmpv6 (
     near_reply_address   BLOB,
     far_reply_address    BLOB,
     capture_second       USMALLINT NOT NULL,
+    capture_order        USMALLINT NOT NULL,
     time_deltas          UINTEGER NOT NULL
 );
 
@@ -367,6 +406,7 @@ CREATE TABLE IF NOT EXISTS fies_udpv4 (
     near_reply_address   BLOB,
     far_reply_address    BLOB,
     capture_second       USMALLINT NOT NULL,
+    capture_order        USMALLINT NOT NULL,
     time_deltas          UINTEGER NOT NULL
 );
 
@@ -375,6 +415,7 @@ CREATE TABLE IF NOT EXISTS fies_udpv6 (
     near_reply_address   BLOB,
     far_reply_address    BLOB,
     capture_second       USMALLINT NOT NULL,
+    capture_order        USMALLINT NOT NULL,
     time_deltas          UINTEGER NOT NULL
 );
 `
@@ -467,6 +508,7 @@ func (f *captureHandle) append(row compactedFIE) error {
 		row.nearReply,
 		row.farReply,
 		row.captureSecond,
+		row.captureOrder,
 		row.timeDeltas,
 	); err != nil {
 		return fmt.Errorf("append row: %w", err)
@@ -559,13 +601,14 @@ type compactedFIE struct {
 	nearReply     []byte
 	farReply      []byte
 	captureSecond uint16
+	captureOrder  uint16
 	timeDeltas    uint32
 	isIPv4        bool
 	protocol      api.Protocol
 }
 
 //nolint:funlen,gocyclo
-func compactFIE(fie *api.ForwardingInfoElement, captureTime time.Time, rotationInterval time.Duration) (compactedFIE, error) {
+func compactFIE(fie *api.ForwardingInfoElement, captureTime time.Time, rotationInterval time.Duration, captureOrder uint32) (compactedFIE, error) {
 	switch {
 	case fie.Protocol == api.ICMP && fie.IPVersion == api.IPv4:
 	case fie.Protocol == api.ICMPv6 && fie.IPVersion == api.IPv6:
@@ -629,17 +672,22 @@ func compactFIE(fie *api.ForwardingInfoElement, captureTime time.Time, rotationI
 
 	productionDelta := timestampDelta(captureTime, fie.ProductionTimestamp)
 
+	captureOrderLow := uint16(captureOrder & 0xffff)
+	captureOrderHigh := (captureOrder >> 16) & 0x3
+
 	timeDeltas := uint32(productionDelta) |
 		uint32(nearSentDelta)<<6 |
 		uint32(nearRecvDelta)<<12 |
 		uint32(farSentDelta)<<18 |
-		uint32(farRecvDelta)<<24
+		uint32(farRecvDelta)<<24 |
+		captureOrderHigh<<30
 
 	return compactedFIE{
 		pdID:          uint32(fie.ProbingDirectiveID),
 		nearReply:     nearReply,
 		farReply:      farReply,
 		captureSecond: uint16(captureSeconds),
+		captureOrder:  captureOrderLow,
 		timeDeltas:    timeDeltas,
 		isIPv4:        isIPv4,
 		protocol:      fie.Protocol,
@@ -655,12 +703,8 @@ func timestampDelta(reference, timestamp time.Time) uint8 {
 
 	// Timestamp being after its reference indicates clock skew or
 	// otherwise unexpected timing data.
-	if delta < 0 {
+	if delta < 0 || delta >= 63 {
 		return 63
-	}
-
-	if delta >= 62 {
-		return 62
 	}
 
 	return uint8(delta)
