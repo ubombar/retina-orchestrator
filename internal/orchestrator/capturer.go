@@ -496,21 +496,13 @@ func compactFIE(fie *api.ForwardingInfoElement, captureTime time.Time, rotationI
 	)
 
 	if fie.NearInfo != nil {
-		var err error
-		nearReply, err = compactIP(fie.NearInfo.ReplyAddress)
-		if err != nil {
-			return compactedFIE{}, fmt.Errorf("near reply: %w", err)
-		}
+		nearReply = compactIP(fie.NearInfo.ReplyAddress)
 		nearSentDelta = timestampDelta(captureTime, fie.NearInfo.SentTimestamp)
 		nearRecvDelta = timestampDelta(captureTime, fie.NearInfo.ReceivedTimestamp)
 	}
 
 	if fie.FarInfo != nil {
-		var err error
-		farReply, err = compactIP(fie.FarInfo.ReplyAddress)
-		if err != nil {
-			return compactedFIE{}, fmt.Errorf("far reply: %w", err)
-		}
+		farReply = compactIP(fie.FarInfo.ReplyAddress)
 		farSentDelta = timestampDelta(captureTime, fie.FarInfo.SentTimestamp)
 		farRecvDelta = timestampDelta(captureTime, fie.FarInfo.ReceivedTimestamp)
 	}
@@ -548,23 +540,23 @@ func timestampDelta(reference, timestamp time.Time) uint8 {
 	return uint8(delta)
 }
 
-func compactIP(ip net.IP) ([]byte, error) {
+func compactIP(ip net.IP) []byte {
 	if ip == nil || ip.IsUnspecified() {
-		return nil, nil
+		return nil
 	}
 
 	if v4 := ip.To4(); v4 != nil {
-		return []byte{v4[0], v4[1], v4[2], v4[3]}, nil
+		return []byte{v4[0], v4[1], v4[2], v4[3]}
 	}
 
 	v6 := ip.To16()
 	if v6 == nil {
-		return nil, fmt.Errorf("invalid IP address %v", ip)
+		return nil
 	}
 
 	out := make([]byte, net.IPv6len)
 	copy(out, v6)
-	return out, nil
+	return out
 }
 
 func timeToFilename(t time.Time) string {
