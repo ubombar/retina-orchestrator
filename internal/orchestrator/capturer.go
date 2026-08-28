@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
-	"github.com/marcboeker/go-duckdb/v2"
+	"github.com/duckdb/duckdb-go/v2"
 )
 
 // FIECapturer is the interface, the Flush() and Close() methods needs to be
