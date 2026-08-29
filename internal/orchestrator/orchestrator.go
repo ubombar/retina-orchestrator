@@ -487,8 +487,10 @@ func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 
 			// Before pushing to the ring buffer capture the fie.
 			if o.capturer != nil {
-				if err := o.capturer.Capture(ctx, fie); err != nil {
-					return err
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case o.captureCh <- fie:
 				}
 			}
 			_ = o.fieRingBuffer.Push(fie)
