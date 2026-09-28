@@ -88,6 +88,7 @@ func run() error {
 		rrDisablePDInsertedEvents     = flag.Bool("rr-disable-pd-inserted-events", envOrDefaultBool("RETINA_RR_DISABLE_PD_INSERTED_EVENTS", true), "Disable emitting PD inserted events")
 		rrDisablePeriodDumpEvents     = flag.Bool("rr-disable-period-dump-events", envOrDefaultBool("RETINA_RR_DISABLE_PERIOD_DUMP_EVENTS", true), "Disable emitting period dump events")
 		rrDisableSchedulerLateEvents  = flag.Bool("rr-disable-scheduler-late-events", envOrDefaultBool("RETINA_RR_DISABLE_SCHEDULER_LATE_EVENTS", true), "Disable emitting scheduler late events")
+		rrSingleIssuance              = flag.Bool("rr-single-issuance", envOrDefaultBool("RETINA_RR_SINGLE_ISSUANCE", false), "Issue each PD exactly once instead of rescheduling it")
 
 		// --- DDBFIECapturerConfig (capturer- prefix) ---
 		capturerEnabled                 = flag.Bool("capturer-enabled", envOrDefaultBool("RETINA_CAPTURER_ENABLED", true), "Enable capturing FIEs to DuckDB")
@@ -166,6 +167,7 @@ func run() error {
 			DisablePDInsertedEvents:     *rrDisablePDInsertedEvents,
 			DisablePeriodDumps:          *rrDisablePeriodDumpEvents,
 			DisableSchedulerLateEvents:  *rrDisableSchedulerLateEvents,
+			SingleIssuance:              *rrSingleIssuance,
 		},
 		CapturerConfig:        capturerConfig,
 		CaptureChannelSize:    *capturerChannelSize,
@@ -188,6 +190,7 @@ func run() error {
 		slog.Float64("rr_admission_rate", *rrAdmissionRate),
 		slog.Bool("rr_disable_responsible_probing", *rrDisableResponsibleProbing),
 		slog.Bool("rr_disable_staleness", *rrDisableStaleness),
+		slog.Bool("rr_single_issuance", *rrSingleIssuance),
 	)
 
 	if err := orch.Run(ctx); !errors.Is(err, ctx.Err()) {

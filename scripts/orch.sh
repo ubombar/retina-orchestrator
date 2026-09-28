@@ -15,6 +15,7 @@ RR_MAX_ISSUANCE_PERIOD=12h
 RR_STARTING_ISSUANCE_PERIOD=10s
 RR_DISABLE_RESPONSIBLE_PROBING=true
 RR_DISABLE_STALENESS=true
+RR_SINGLE_ISSUANCE=false
 
 ./retina-orchestrator \
 	--api-addr=":8080" \
@@ -61,4 +62,5 @@ RR_DISABLE_STALENESS=true
 	--rr-disable-period-adjustment-events=true \
 	--rr-disable-pd-inserted-events=true \
 	--rr-disable-period-dump-events=true \
-	--rr-disable-scheduler-late-events=true
+	--rr-disable-scheduler-late-events=true \
+	--rr-single-issuance="${RR_SINGLE_ISSUANCE}"

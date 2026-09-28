@@ -128,6 +128,11 @@ type ResearchSchedulerConfig struct {
 
 	// DisableSchedulerLateEvents disables the SchedulerLate events.
 	DisableSchedulerLateEvents bool `json:"disable_scheduler_late_events"`
+
+	// SingleIssuance makes every PD one-shot: it is issued exactly once and
+	// is never rescheduled. The period learning rules (§4.2) are not applied,
+	// since there is no next issuance whose period they could adjust.
+	SingleIssuance bool `json:"single_issuance"`
 }
 
 // validate checks the configuration and returns an error describing the
@@ -411,7 +416,8 @@ func NewResearchScheduler(config *ResearchSchedulerConfig, logger *slog.Logger, 
 		slog.Float64("max_issuance_period_mu_max", config.MaxIssuancePeriod.Seconds()),
 		slog.Float64("admission_rate_r0", config.AdmissionRate),
 		slog.Bool("disable_responsible_probing", config.DisableResponsibleProbing),
-		slog.Bool("disable_staleness", config.DisableStaleness))
+		slog.Bool("disable_staleness", config.DisableStaleness),
+		slog.Bool("single_issuance", config.SingleIssuance))
 
 	// This separate thread dumps all the info about the periods.
 	g, gCtx := errgroup.WithContext(ctx)
@@ -509,8 +515,12 @@ func (s *ResearchScheduler) Next() (*api.ProbingDirective, error) {
 				})
 			}
 		}
-		s.compute(rec, now)
-		heap.Push(&s.queue, rec)
+		if s.cfg.SingleIssuance {
+			s.retire(rec, now)
+		} else {
+			s.compute(rec, now)
+			heap.Push(&s.queue, rec)
+		}
 
 		for time.Now().Before(target) {
 		}
@@ -797,6 +807,26 @@ func (s *ResearchScheduler) reserveAndFloor(addr net.IP, now time.Time, impactDe
 		return 0
 	}
 	return floor
+}
+
+// retire accounts for a one-shot issuance (SingleIssuance): the record is not
+// pushed back onto the queue, so its requested rate leaves the aggregate and
+// its clamp membership is released. lastIssuedAt is still set — FIEs arriving
+// after the issuance need it to derive the impact delay in update().
+//
+// The record stays in s.records and in periodArray: the PD keeps its identity
+// for late FIEs and for period dumps, it is simply never due again.
+func (s *ResearchScheduler) retire(rec *pdRecord, t time.Time) {
+	rec.lastIssuedAt = t
+	s.totalIssuances++
+
+	s.sumRate -= 1 / rec.issuancePeriod
+	if rec.issuancePeriod == s.cfg.MinIssuancePeriod.Seconds() {
+		s.pdsClampedAtMin--
+	}
+	if rec.issuancePeriod == s.cfg.MaxIssuancePeriod.Seconds() {
+		s.pdsClampedAtMax--
+	}
 }
 
 // compute applies the learning rules to the just-popped PD and reschedules
