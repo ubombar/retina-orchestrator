@@ -13,12 +13,18 @@ set -uo pipefail
 FILE="${1:?Usage: $0 <jsonl_file> [batch_size=10000] [server_url=http://localhost:8080]}"
 BATCH_SIZE="${2:-10000}"
 SERVER_URL="${3:-http://localhost:8080}"
-MAX_TIME="${MAX_TIME:-60}"
+MAX_TIME="${MAX_TIME:-36000}"
 
-[ -f "$FILE" ] || { echo "File not found: $FILE" >&2; exit 1; }
-command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
+[ -f "$FILE" ] || {
+	echo "File not found: $FILE" >&2
+	exit 1
+}
+command -v jq >/dev/null 2>&1 || {
+	echo "jq is required" >&2
+	exit 1
+}
 
-TOTAL_LINES=$(wc -l < "$FILE" | tr -d ' ')
+TOTAL_LINES=$(wc -l <"$FILE" | tr -d ' ')
 TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/bulk_push.XXXXXX")
 cleanup() { rm -rf "$TMPDIR"; }
 trap cleanup EXIT
@@ -36,17 +42,17 @@ START_TIME=$(date +%s)
 
 for chunk in "${CHUNKS[@]}"; do
 	CHUNK_NUM=$((CHUNK_NUM + 1))
-	LINES_IN_CHUNK=$(wc -l < "$chunk" | tr -d ' ')
+	LINES_IN_CHUNK=$(wc -l <"$chunk" | tr -d ' ')
 
 	BATCH_START=$(date +%s)
-	RESPONSE=$(jq -s '{probing_directives: .}' "$chunk" | \
+	RESPONSE=$(jq -s '{probing_directives: .}' "$chunk" |
 		curl -sS -X POST "$SERVER_URL/api/v1/pds" \
 			-H "Content-Type: application/json" \
 			--data-binary @- \
 			--max-time "$MAX_TIME" \
 			-w $'\n%{http_code}' 2>&1)
 	CURL_EXIT=$?
-	BATCH_ELAPSED=$(( $(date +%s) - BATCH_START ))
+	BATCH_ELAPSED=$(($(date +%s) - BATCH_START))
 
 	HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
 	BODY=$(echo "$RESPONSE" | sed '$d')
@@ -79,5 +85,5 @@ for chunk in "${CHUNKS[@]}"; do
 	rm -f "$chunk"
 done
 
-TOTAL_ELAPSED=$(( $(date +%s) - START_TIME ))
+TOTAL_ELAPSED=$(($(date +%s) - START_TIME))
 echo "Done. Sent $SENT/$TOTAL_LINES lines across $TOTAL_CHUNKS batches in ${TOTAL_ELAPSED}s."
