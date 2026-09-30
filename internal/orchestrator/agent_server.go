@@ -16,9 +16,14 @@ import (
 	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
-// agentKeepalivePeriod is the interval between TCP keepalive probes
-// for agent connections.
-const agentKeepalivePeriod = 10 * time.Second
+// TCP keepalive detects agent connections that have become unreachable without
+// being closed cleanly. These values detect a black-holed connection in roughly
+// one minute: 30 seconds idle followed by up to three probes 10 seconds apart.
+const (
+	agentKeepaliveIdle     = 30 * time.Second
+	agentKeepaliveInterval = 10 * time.Second
+	agentKeepaliveCount    = 3
+)
 
 // agentSendTimeout is the deadline for sending a probing directive to an agent.
 // Without a deadline, a dead agent will block the sender goroutine indefinitely
@@ -242,11 +247,13 @@ type agentStream struct {
 }
 
 func newAgentStream(id int, conn *net.TCPConn, server *agentServer) (*agentStream, error) {
-	if err := conn.SetKeepAlive(true); err != nil {
-		return nil, fmt.Errorf("failed to enable keepalive: %w", err)
-	}
-	if err := conn.SetKeepAlivePeriod(agentKeepalivePeriod); err != nil {
-		return nil, fmt.Errorf("failed to set keepalive period: %w", err)
+	if err := conn.SetKeepAliveConfig(net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     agentKeepaliveIdle,
+		Interval: agentKeepaliveInterval,
+		Count:    agentKeepaliveCount,
+	}); err != nil {
+		return nil, fmt.Errorf("failed to configure keepalive: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118
