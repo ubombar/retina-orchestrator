@@ -1,274 +1,66 @@
 // Copyright (c) 2025 Sorbonne Université
 // SPDX-License-Identifier: MIT
 
-// @title			IP Routes Live API
-// @version		1.0
-// @description	Streams forwarding info elements from connected Retina agents.
-// @host			iprl.dioptra.io
-// @BasePath		/api/v1
 package main
 
 import (
 	"context"
-	"errors"
 	"flag"
-	"fmt"
 	"log/slog"
-	"net"
-	"net/http"
-	"net/http/pprof"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-
-	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator"
+	"github.com/dioptra-io/retina-orchestrator/internal/retina"
 )
 
 func main() {
 	if err := run(); err != nil {
-		slog.Error("Orchestrator error", "err", err)
+		slog.Error("Orchestrator error", slog.Any("err", err))
 		os.Exit(1)
 	}
 }
 
-//nolint:funlen
 func run() error {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-		flag.VisitAll(func(f *flag.Flag) {
-			fmt.Fprintf(os.Stderr, "  --%s\n", f.Name)
-			fmt.Fprintf(os.Stderr, "    \t%s (default %v)\n", f.Usage, f.DefValue)
-		})
-	}
-
-	var (
-		apiAddr              = flag.String("api-addr", envOrDefault("RETINA_API_ADDR", "localhost:8080"), "Listening address for the HTTP API server")
-		agentAddr            = flag.String("agent-addr", envOrDefault("RETINA_AGENT_ADDR", "localhost:50050"), "Listening address for agent connections")
-		agentBufferLength    = flag.Int("agent-buffer-length", envOrDefaultInt("RETINA_AGENT_BUFFER_LENGTH", 8192), "Buffer length for per-agent PD channels")
-		pdQueueSize          = flag.Int("pd-queue-size", envOrDefaultInt("RETINA_PD_QUEUE_SIZE", 100), "The size of the agent queue")
-		pdPushTimeout        = flag.Duration("pd-push-timeout", envOrDefaultDuration("RETINA_PD_PUSH_TIMEOUT", time.Second), "How long the scheduler waits for room in a connected agent's full queue before dropping the PD (0 waits until room or disconnect)")
-		ringBufferSize       = flag.Int("ring-buffer-size", envOrDefaultInt("RETINA_RING_BUFFER_SIZE", 100), "The size of the ring buffer")
-		eventBusSize         = flag.Int("event-bus-size", envOrDefaultInt("RETINA_EVENT_BUS_SIZE", 1024*1024), "Size of the event bus")
-		eventsDir            = flag.String("events-dir", envOrDefault("RETINA_EVENTS_DIR", ""), "Directory where orchestrator events are written as JSONL; empty disables event persistence")
-		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", envOrDefaultDuration("RETINA_API_READ_HEADER_TIMEOUT", 5*time.Second), "Timeout for reading HTTP request headers")
-		fieFilterPolicy      = flag.String("fie-filter-policy", envOrDefault("RETINA_FIE_FILTER_POLICY", "any"), "FIE filtering policy: any, one, or both")
-		logLevel             = flag.String("log-level", envOrDefault("RETINA_LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
-		metricsAddr          = flag.String("metrics-addr", envOrDefault("RETINA_METRICS_ADDR", ":9312"), "Address to expose Prometheus metrics on")
-
-		streamStartFromEarliest = flag.Bool("stream-start-from-earliest", envOrDefaultBool("RETINA_STREAM_START_FROM_EARLIEST", true), "If true, newly connected FIE stream clients start from the earliest FIE still in the ring buffer instead of only future ones")
-
-		// --- ResearchSchedulerConfig (rr- prefix) ---
-		rrStartingPeriod   = flag.Duration("rr-starting-period", envOrDefaultDuration("RETINA_RR_STARTING_PERIOD", 10*time.Second), "Fixed issuance period assigned to each new PD")
-		rrMaxIssuanceCount = flag.Uint64("rr-max-issuance-count", envOrDefaultUInt64("RETINA_RR_MAX_ISSUANCE_COUNT", 0), "Number of times each PD is issued before retirement (0 means indefinitely)")
-		rrMaxEventsPerPass = flag.Int("rr-max-events-per-pass", envOrDefaultInt("RETINA_RR_MAX_EVENTS_PER_PASS", 64), "Maximum scheduler events applied between issuance attempts")
-		rrEventChannelSize = flag.Int("rr-event-channel-size", envOrDefaultInt("RETINA_RR_EVENT_CHANNEL_SIZE", 1024), "Buffer size of the scheduler event channel")
-
-		// --- DDBFIECapturerConfig (capturer- prefix) ---
-		capturerEnabled                 = flag.Bool("capturer-enabled", envOrDefaultBool("RETINA_CAPTURER_ENABLED", true), "Enable capturing FIEs to DuckDB")
-		capturerAllowNonEmptyCaptureDir = flag.Bool("capturer-allow-non-empty-capture-dir", envOrDefaultBool("RETINA_CAPTURER_ALLOW_NON_EMPTY_CAPTURE_DIR", false), "Allow capturing into a non-empty capture directory")
-		capturerBatchSize               = flag.Int("capturer-batch-size", envOrDefaultInt("RETINA_CAPTURER_BATCH_SIZE", 100_000), "Number of FIEs accumulated before flushing DuckDB appenders")
-		capturerCaptureDir              = flag.String("capturer-capture-dir", envOrDefault("RETINA_CAPTURER_CAPTURE_DIR", "./capture"), "Directory where DuckDB FIE capture files are stored")
-		capturerRotationInterval        = flag.Duration("capturer-rotation-interval", envOrDefaultDuration("RETINA_CAPTURER_ROTATION_INTERVAL", 6*time.Hour), "Rotation interval for DuckDB FIE capture files")
-		capturerChannelSize             = flag.Int("capturer-channel-size", envOrDefaultInt("RETINA_CAPTURER_CHANNEL_SIZE", 200_000), "Buffer size of the FIE capture channel")
-		capturerFlushPeriod             = flag.Duration("capturer-flush-period", envOrDefaultDuration("RETINA_CAPTURER_FLUSH_PERIOD", time.Second), "Interval between periodic FIE capturer flushes")
-	)
-	flag.Parse()
-
-	logger := newLogger(*logLevel)
-
-	registry := prometheus.NewRegistry()
-	registry.MustRegister(collectors.NewGoCollector())
-	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	metrics := orchestrator.NewMetrics(registry)
-	metricsSrv, err := startMetricsServer(logger, registry, *metricsAddr)
-	if err != nil {
-		return err
-	}
-
-	secret := os.Getenv("RETINA_SECRET")
-
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	var capturerConfig *orchestrator.DDBFIECapturerConfig
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	if *capturerEnabled {
-		capturerConfig = &orchestrator.DDBFIECapturerConfig{
-			AllowNonEmptyCaptureDir: *capturerAllowNonEmptyCaptureDir,
-			BatchSize:               *capturerBatchSize,
-			CaptureDir:              *capturerCaptureDir,
-			RotationInterval:        *capturerRotationInterval,
-		}
-	}
+	config := &retina.Config{}
+	flag.StringVar(&config.Agent.Address, "agent-addr", "localhost:50050", "Listening address for agent connections")
+	flag.DurationVar(&config.Agent.HandshakeTimeout, "agent-handshake-timeout", 5*time.Second, "Time an agent has to complete the handshake (0 for no limit)")
+	flag.DurationVar(&config.Agent.KeepAliveIdle, "agent-keepalive-idle", 30*time.Second, "Idle time before TCP keepalive probes are sent on an agent connection")
+	flag.DurationVar(&config.Agent.KeepAliveInterval, "agent-keepalive-interval", 10*time.Second, "Time between TCP keepalive probes on an agent connection")
+	flag.IntVar(&config.Agent.KeepAliveCount, "agent-keepalive-count", 3, "Unanswered TCP keepalive probes before an agent connection is closed")
 
-	orch, err := orchestrator.NewOrchestrator(&orchestrator.Config{
-		AgentAddress:            *agentAddr,
-		PDQueueSize:             *pdQueueSize,
-		PDPushTimeout:           *pdPushTimeout,
-		RingBufferSize:          *ringBufferSize,
-		AgentBufferLength:       *agentBufferLength,
-		APIAddress:              *apiAddr,
-		APIReadHeaderTimeout:    *apiReadHeaderTimeout,
-		FIEFilterPolicy:         *fieFilterPolicy,
-		Secret:                  secret,
-		EventBusSize:            *eventBusSize,
-		EventsDir:               *eventsDir,
-		StreamStartFromEarliest: *streamStartFromEarliest,
-		ResearchSchedulerConfig: &orchestrator.ResearchSchedulerConfig{
-			StartingPeriod:   *rrStartingPeriod,
-			MaxIssuanceCount: *rrMaxIssuanceCount,
-			MaxEventsPerPass: *rrMaxEventsPerPass,
-			EventChannelSize: *rrEventChannelSize,
-		},
-		CapturerConfig:        capturerConfig,
-		CaptureChannelSize:    *capturerChannelSize,
-		CapturerFlushPeriod:   *capturerFlushPeriod,
-		EventRotationInterval: *capturerRotationInterval, // make sure event and fies have the same rotation interval
-	}, logger, metrics)
+	flag.StringVar(&config.API.Address, "api-addr", "localhost:8080", "Listening address for the HTTP API")
+	flag.DurationVar(&config.API.ReadHeaderTimeout, "api-read-header-timeout", 5*time.Second, "Timeout for reading HTTP request headers (0 for no limit)")
+
+	flag.DurationVar(&config.Scheduler.StartingPeriod, "scheduler-starting-period", 10*time.Second, "Issuance period of every new PD, and the delay before its first issuance")
+	flag.Uint64Var(&config.Scheduler.MaxIssuanceCount, "scheduler-max-issuance-count", 0, "Number of times each PD is issued before it leaves the schedule (0 for indefinitely)")
+	flag.IntVar(&config.Scheduler.EventQueueSize, "scheduler-event-queue-size", 1024, "Size of the scheduler event queue (at least 1)")
+
+	flag.StringVar(&config.Capturer.CaptureDir, "capturer-capture-dir", "./capture", "Directory where the DuckDB FIE capture files are written")
+	flag.BoolVar(&config.Capturer.AllowNonEmptyCaptureDir, "capturer-allow-non-empty-capture-dir", false, "Allow capturing into a directory that already has files")
+	flag.DurationVar(&config.Capturer.RotationInterval, "capturer-rotation-interval", time.Hour, "Time span covered by one capture file (at most 18h)")
+	flag.IntVar(&config.Capturer.BatchSize, "capturer-batch-size", 100_000, "Number of FIEs appended before the capture file is flushed")
+	flag.IntVar(&config.CaptureQueueSize, "capturer-queue-size", 200_000, "Number of received FIEs that may wait to be captured")
+	flag.DurationVar(&config.CaptureFlushPeriod, "capturer-flush-period", time.Second, "Interval between periodic flushes of the capture file")
+	flag.Parse()
+
+	// The secret is read from the environment only, so that it does not show
+	// up in the process list.
+	config.Agent.Secret = os.Getenv("RETINA_SECRET")
+
+	stop := context.AfterFunc(ctx, func() { logger.Info("Shut down signal detected") })
+	defer stop()
+
+	orch, err := retina.NewOrchestrator(config, logger)
 	if err != nil {
 		return err
 	}
 
-	logger.Info("Starting orchestrator",
-		slog.String("api_addr", *apiAddr),
-		slog.String("agent_addr", *agentAddr),
-		slog.String("log_level", *logLevel),
-		slog.String("metrics_addr", *metricsAddr),
-		slog.Bool("stream_start_from_earliest", *streamStartFromEarliest),
-		slog.Duration("rr_starting_period", *rrStartingPeriod),
-		slog.Uint64("rr_max_issuance_count", *rrMaxIssuanceCount),
-	)
-
-	if err := orch.Run(ctx); !errors.Is(err, ctx.Err()) {
-		return err
-	}
-
-	shutdown(logger, metricsSrv)
-	return nil
-}
-
-// startMetricsServer starts an HTTP server exposing Prometheus metrics at /metrics.
-// It binds eagerly so that a port conflict is detected before the orchestrator starts.
-func startMetricsServer(logger *slog.Logger, registry *prometheus.Registry, addr string) (*http.Server, error) {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("metrics server: %w", err)
-	}
-
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
-
-	// Runtime profiles, served next to the metrics on the same internal-only
-	// address: go tool pprof http://<metrics-addr>/debug/pprof/profile
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-
-	//nolint:gosec // G112: metrics endpoint is internal-only; timeout omitted intentionally
-	srv := &http.Server{Handler: mux}
-
-	go func() {
-		logger.Info("Starting metrics server", slog.String("addr", addr))
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("Metrics server failed", slog.Any("err", err))
-		}
-	}()
-
-	return srv, nil
-}
-
-// newLogger creates a JSON logger writing to stdout at the given level.
-// Falls back to info if the level string is unrecognized.
-func newLogger(level string) *slog.Logger {
-	var l slog.Level
-	if err := l.UnmarshalText([]byte(level)); err != nil {
-		l = slog.LevelInfo
-	}
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: l,
-	}))
-}
-
-func shutdown(logger *slog.Logger, metricsSrv *http.Server) {
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("Metrics server shutdown failed", slog.Any("err", err))
-	}
-	logger.Info("Shutting down orchestrator")
-}
-
-func envOrDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func envOrDefaultUInt64(key string, def uint64) uint64 {
-	if v := os.Getenv(key); v != "" {
-		i, err := strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
-			os.Exit(1)
-		}
-		return i
-	}
-	return def
-}
-
-func envOrDefaultInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		i, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
-			os.Exit(1)
-		}
-		return int(i)
-	}
-	return def
-}
-
-func envOrDefaultFloat64(key string, def float64) float64 {
-	if v := os.Getenv(key); v != "" {
-		i, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
-			os.Exit(1)
-		}
-		return i
-	}
-	return def
-}
-
-func envOrDefaultDuration(key string, def time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
-			os.Exit(1)
-		}
-		return d
-	}
-	return def
-}
-
-func envOrDefaultBool(key string, def bool) bool {
-	if v := os.Getenv(key); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
-			os.Exit(1)
-		}
-		return b
-	}
-	return def
+	return orch.Run(ctx)
 }

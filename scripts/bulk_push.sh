@@ -59,10 +59,9 @@ for chunk in "${CHUNKS[@]}"; do
 
 	if [ "$CURL_EXIT" -eq 28 ]; then
 		echo "[chunk $CHUNK_NUM/$TOTAL_CHUNKS] TIMED OUT after ${MAX_TIME}s (curl exit 28)." >&2
-		echo "  This means the request did not complete within --max-time. With no agents" >&2
-		echo "  connected (or agents slower than the insertion rate), the scheduler's" >&2
-		echo "  internal insert channel fills up and Insert() blocks indefinitely -- the" >&2
-		echo "  server never returns a response, successful or not." >&2
+		echo "  The request did not complete within --max-time. The orchestrator answers a" >&2
+		echo "  batch as soon as it is queued for the scheduler, so check that it is running" >&2
+		echo "  and reachable at $SERVER_URL." >&2
 		echo "  Sent so far (across completed batches): $SENT/$TOTAL_LINES" >&2
 		exit 28
 	fi

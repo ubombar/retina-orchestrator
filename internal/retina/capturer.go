@@ -1,10 +1,10 @@
-// Package orchestrator implements a compact, rotating DuckDB capturer for
+// Package retina implements a compact, rotating DuckDB capturer for
 // high-frequency ForwardingInfoElement streams.
 //
 // Dependency (go.mod):
 //
 //	github.com/marcboeker/go-duckdb/v2
-package orchestrator
+package retina
 
 import (
 	"context"

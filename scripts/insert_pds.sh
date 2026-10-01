@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./bulk_insert.sh path/to/pds.jsonl [server_url]
+# Sends a whole PD JSONL file to the orchestrator in one request.
+# Usage: ./insert_pds.sh path/to/pds.jsonl [server_url]
 JSONL_FILE="${1:?Usage: $0 <jsonl_file> [server_url]}"
 SERVER_URL="${2:-http://localhost:8080}"
 
