@@ -64,33 +64,10 @@ func run() error {
 		streamStartFromEarliest = flag.Bool("stream-start-from-earliest", envOrDefaultBool("RETINA_STREAM_START_FROM_EARLIEST", true), "If true, newly connected FIE stream clients start from the earliest FIE still in the ring buffer instead of only future ones")
 
 		// --- ResearchSchedulerConfig (rr- prefix) ---
-		rrSeed                        = flag.Uint64("rr-seed", envOrDefaultUInt64("RETINA_RR_SEED", 42), "Seed for the research scheduler's internal RNG")
-		rrLearningRate                = flag.Float64("rr-learning-rate", envOrDefaultFloat64("RETINA_RR_LEARNING_RATE", 0.1), "Learning rate (α) for the research scheduler's period adjustment")
-		rrSamplingWidth               = flag.Float64("rr-sampling-width", envOrDefaultFloat64("RETINA_RR_SAMPLING_WIDTH", 0.1), "Sampling width (β) for uniform inter-issuance sampling")
-		rrImpactThreshold             = flag.Float64("rr-impact-threshold", envOrDefaultFloat64("RETINA_RR_IMPACT_THRESHOLD", 1.0), "Impact threshold (Λ) for the research scheduler's responsible probing")
-		rrFIEHistoryCapacity          = flag.Int("rr-fie-history-capacity", envOrDefaultInt("RETINA_RR_FIE_HISTORY_CAPACITY", 6), "Number of FIEs retained per PD for the staleness rule")
-		rrMinIssuancePeriod           = flag.Duration("rr-min-issuance-period", envOrDefaultDuration("RETINA_RR_MIN_ISSUANCE_PERIOD", 500*time.Millisecond), "Minimum issuance period (μmin)")
-		rrMaxIssuancePeriod           = flag.Duration("rr-max-issuance-period", envOrDefaultDuration("RETINA_RR_MAX_ISSUANCE_PERIOD", 12*time.Hour), "Maximum issuance period (μmax)")
-		rrAdmissionRate               = flag.Float64("rr-admission-rate", envOrDefaultFloat64("RETINA_RR_ADMISSION_RATE", 1000), "Admission rate (r₀) for pacing newly inserted PDs' first issuance")
-		rrStartingIssuancePeriod      = flag.Duration("rr-starting-issuance-period", envOrDefaultDuration("RETINA_RR_STARTING_ISSUANCE_PERIOD", time.Second*10), "Starting issuance period (Μ) assigned at admission")
-		rrStatusInterval              = flag.Duration("rr-status-interval", envOrDefaultDuration("RETINA_RR_STATUS_INTERVAL", 20*time.Second), "Interval between CurrentStatus event emissions")
-		rrPeriodDumpInterval          = flag.Duration("rr-period-dump-interval", envOrDefaultDuration("RETINA_RR_PERIOD_DUMP_INTERVAL", 20*time.Second), "Interval between PeriodDump event emissions")
-		rrInsertChannelSize           = flag.Int("rr-insert-channel-size", envOrDefaultInt("RETINA_RR_INSERT_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's insert channel")
-		rrUpdateChannelSize           = flag.Int("rr-update-channel-size", envOrDefaultInt("RETINA_RR_UPDATE_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's FIE update channel")
-		rrLatenessTolerance           = flag.Duration("rr-lateness-tolerance", envOrDefaultDuration("RETINA_RR_LATENESS_TOLERANCE", 25*time.Millisecond), "Slack below which an issuance is not considered late")
-		rrBusyTolerance               = flag.Duration("rr-busy-tolerance", envOrDefaultDuration("RETINA_RR_BUSY_TOLERANCE", 500*time.Microsecond), "Commitment-window width for the hybrid sleep strategy (Tbusy)")
-		rrWaitTolerance               = flag.Duration("rr-wait-tolerance", envOrDefaultDuration("RETINA_RR_WAIT_TOLERANCE", time.Millisecond), "Busy-wait margin to absorb time.After over-sleep")
-		rrInitialQueueSize            = flag.Int("rr-initial-queue-size", envOrDefaultInt("RETINA_RR_INITIAL_QUEUE_SIZE", 100_000), "Initial capacity reserved for the scheduling heap")
-		rrMaxUpdateDrainPerIssuance   = flag.Int("rr-max-update-drain-per-issuance", envOrDefaultInt("RETINA_RR_MAX_UPDATE_DRAIN_PER_ISSUANCE", 5), "Maximum FIE updates drained per issuance call")
-		rrMaxInsertDrainPerIssuance   = flag.Int("rr-max-insert-drain-per-issuance", envOrDefaultInt("RETINA_RR_MAX_INSERT_DRAIN_PER_ISSUANCE", 5), "Maximum inserts drained per issuance call")
-		rrDefaultImpactDelay          = flag.Duration("rr-default-impact-delay", envOrDefaultDuration("RETINA_RR_DEFAULT_IMPACT_DELAY", time.Second), "Default estimated delay between a PD's issuance and its impact on an address")
-		rrDisableResponsibleProbing   = flag.Bool("rr-disable-responsible-probing", envOrDefaultBool("RETINA_RR_DISABLE_RESPONSIBLE_PROBING", false), "Disable the responsible probing constraint (testing only)")
-		rrDisableStaleness            = flag.Bool("rr-disable-staleness", envOrDefaultBool("RETINA_RR_DISABLE_STALENESS", false), "Disable the staleness-based period adjustment (testing only)")
-		rrDisablePeriodAdjustedEvents = flag.Bool("rr-disable-period-adjustment-events", envOrDefaultBool("RETINA_RR_DISABLE_PERIOD_ADJUSTED_EVENTS", true), "Disable emitting period adjusted events")
-		rrDisablePDInsertedEvents     = flag.Bool("rr-disable-pd-inserted-events", envOrDefaultBool("RETINA_RR_DISABLE_PD_INSERTED_EVENTS", true), "Disable emitting PD inserted events")
-		rrDisablePeriodDumpEvents     = flag.Bool("rr-disable-period-dump-events", envOrDefaultBool("RETINA_RR_DISABLE_PERIOD_DUMP_EVENTS", true), "Disable emitting period dump events")
-		rrDisableSchedulerLateEvents  = flag.Bool("rr-disable-scheduler-late-events", envOrDefaultBool("RETINA_RR_DISABLE_SCHEDULER_LATE_EVENTS", true), "Disable emitting scheduler late events")
-		rrSingleIssuance              = flag.Bool("rr-single-issuance", envOrDefaultBool("RETINA_RR_SINGLE_ISSUANCE", false), "Issue each PD exactly once instead of rescheduling it")
+		rrStartingPeriod   = flag.Duration("rr-starting-period", envOrDefaultDuration("RETINA_RR_STARTING_PERIOD", 10*time.Second), "Fixed issuance period assigned to each new PD")
+		rrMaxIssuanceCount = flag.Uint64("rr-max-issuance-count", envOrDefaultUInt64("RETINA_RR_MAX_ISSUANCE_COUNT", 0), "Number of times each PD is issued before retirement (0 means indefinitely)")
+		rrMaxEventsPerPass = flag.Int("rr-max-events-per-pass", envOrDefaultInt("RETINA_RR_MAX_EVENTS_PER_PASS", 64), "Maximum scheduler events applied between issuance attempts")
+		rrEventChannelSize = flag.Int("rr-event-channel-size", envOrDefaultInt("RETINA_RR_EVENT_CHANNEL_SIZE", 1024), "Buffer size of the scheduler event channel")
 
 		// --- DDBFIECapturerConfig (capturer- prefix) ---
 		capturerEnabled                 = flag.Bool("capturer-enabled", envOrDefaultBool("RETINA_CAPTURER_ENABLED", true), "Enable capturing FIEs to DuckDB")
@@ -144,33 +121,10 @@ func run() error {
 		EventsDir:               *eventsDir,
 		StreamStartFromEarliest: *streamStartFromEarliest,
 		ResearchSchedulerConfig: &orchestrator.ResearchSchedulerConfig{
-			Seed:                        *rrSeed,
-			LearningRate:                *rrLearningRate,
-			SamplingWidth:               *rrSamplingWidth,
-			ImpactThreshold:             *rrImpactThreshold,
-			FIEHistoryCapacity:          *rrFIEHistoryCapacity,
-			MinIssuancePeriod:           *rrMinIssuancePeriod,
-			MaxIssuancePeriod:           *rrMaxIssuancePeriod,
-			AdmissionRate:               *rrAdmissionRate,
-			StartingIssuancePeriod:      *rrStartingIssuancePeriod,
-			StatusInterval:              *rrStatusInterval,
-			PeriodDumpInterval:          *rrPeriodDumpInterval,
-			InsertChannelSize:           *rrInsertChannelSize,
-			UpdateChannelSize:           *rrUpdateChannelSize,
-			LatenessTolerance:           *rrLatenessTolerance,
-			BusyTolerance:               *rrBusyTolerance,
-			WaitTolerance:               *rrWaitTolerance,
-			InitialQueueSize:            *rrInitialQueueSize,
-			MaxUpdateDrainPerIssuance:   *rrMaxUpdateDrainPerIssuance,
-			MaxInsertDrainPerIssuance:   *rrMaxInsertDrainPerIssuance,
-			DefaultImpactDelay:          *rrDefaultImpactDelay,
-			DisableResponsibleProbing:   *rrDisableResponsibleProbing,
-			DisableStaleness:            *rrDisableStaleness,
-			DisablePeriodAdjustedEvents: *rrDisablePeriodAdjustedEvents,
-			DisablePDInsertedEvents:     *rrDisablePDInsertedEvents,
-			DisablePeriodDumps:          *rrDisablePeriodDumpEvents,
-			DisableSchedulerLateEvents:  *rrDisableSchedulerLateEvents,
-			SingleIssuance:              *rrSingleIssuance,
+			StartingPeriod:   *rrStartingPeriod,
+			MaxIssuanceCount: *rrMaxIssuanceCount,
+			MaxEventsPerPass: *rrMaxEventsPerPass,
+			EventChannelSize: *rrEventChannelSize,
 		},
 		CapturerConfig:        capturerConfig,
 		CaptureChannelSize:    *capturerChannelSize,
@@ -187,13 +141,8 @@ func run() error {
 		slog.String("log_level", *logLevel),
 		slog.String("metrics_addr", *metricsAddr),
 		slog.Bool("stream_start_from_earliest", *streamStartFromEarliest),
-		slog.Float64("rr_impact_threshold", *rrImpactThreshold),
-		slog.Float64("rr_min_issuance_period_seconds", rrMinIssuancePeriod.Seconds()),
-		slog.Float64("rr_max_issuance_period_seconds", rrMaxIssuancePeriod.Seconds()),
-		slog.Float64("rr_admission_rate", *rrAdmissionRate),
-		slog.Bool("rr_disable_responsible_probing", *rrDisableResponsibleProbing),
-		slog.Bool("rr_disable_staleness", *rrDisableStaleness),
-		slog.Bool("rr_single_issuance", *rrSingleIssuance),
+		slog.Duration("rr_starting_period", *rrStartingPeriod),
+		slog.Uint64("rr_max_issuance_count", *rrMaxIssuanceCount),
 	)
 
 	if err := orch.Run(ctx); !errors.Is(err, ctx.Err()) {

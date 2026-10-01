@@ -44,6 +44,7 @@ func (w *blockingFailWriter) Write([]byte) (int, error) {
 func (s *blockingScheduler) Insert(*api.ProbingDirective) (uint64, error) { return 0, nil }
 func (s *blockingScheduler) Next() (*api.ProbingDirective, error)         { return nil, nil }
 func (s *blockingScheduler) Close() error                                 { return nil }
+func (s *blockingScheduler) Agent(string, bool) error                     { return nil }
 func (s *blockingScheduler) Update(*api.ForwardingInfoElement) error {
 	select {
 	case s.updating <- struct{}{}:
@@ -178,7 +179,7 @@ func TestDispatch_ContextCancelled(t *testing.T) {
 // released after the receiver had returned.
 //
 //nolint:gocyclo
-func TestAgentHandler_FailedConnectionUnblocksDispatch(t *testing.T) {
+func TestAgentHandler_FailedConnectionUnblocksDispatch(t *testing.T) { //nolint:funlen
 	t.Parallel()
 
 	sched := &blockingScheduler{updating: make(chan struct{}, 1), release: make(chan struct{})}

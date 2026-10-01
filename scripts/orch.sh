@@ -7,15 +7,9 @@ fi
 
 CAPTURE_DIR="./captures/$(date -u +%Y%m%d_%H%M%S)"
 
-# RR configuration
-RR_LEARNING_RATE=0.5
-RR_SAMPLING_WIDTH=0.0
-RR_MIN_ISSUANCE_PERIOD=1s
-RR_MAX_ISSUANCE_PERIOD=12h
-RR_STARTING_ISSUANCE_PERIOD=10s
-RR_DISABLE_RESPONSIBLE_PROBING=true
-RR_DISABLE_STALENESS=true
-RR_SINGLE_ISSUANCE=false
+# Research scheduler configuration
+RR_STARTING_PERIOD=10s
+RR_MAX_ISSUANCE_COUNT=0
 
 ./retina-orchestrator \
 	--api-addr=":8080" \
@@ -37,30 +31,7 @@ RR_SINGLE_ISSUANCE=false
 	--capturer-rotation-interval=1h \
 	--capturer-channel-size=10000 \
 	--capturer-flush-period=1s \
-	--rr-seed=42 \
-	--rr-learning-rate="${RR_LEARNING_RATE}" \
-	--rr-sampling-width="${RR_SAMPLING_WIDTH}" \
-	--rr-impact-threshold=1.0 \
-	--rr-fie-history-capacity=6 \
-	--rr-min-issuance-period="${RR_MIN_ISSUANCE_PERIOD}" \
-	--rr-max-issuance-period="${RR_MAX_ISSUANCE_PERIOD}" \
-	--rr-admission-rate=1000 \
-	--rr-starting-issuance-period="${RR_STARTING_ISSUANCE_PERIOD}" \
-	--rr-status-interval=1m \
-	--rr-period-dump-interval=10m \
-	--rr-insert-channel-size=1024 \
-	--rr-update-channel-size=1024 \
-	--rr-lateness-tolerance=25ms \
-	--rr-busy-tolerance=500µs \
-	--rr-wait-tolerance=1ms \
-	--rr-initial-queue-size=1000 \
-	--rr-max-update-drain-per-issuance=5 \
-	--rr-max-insert-drain-per-issuance=5 \
-	--rr-default-impact-delay=1s \
-	--rr-disable-responsible-probing="${RR_DISABLE_RESPONSIBLE_PROBING}" \
-	--rr-disable-staleness="${RR_DISABLE_STALENESS}" \
-	--rr-disable-period-adjustment-events=true \
-	--rr-disable-pd-inserted-events=true \
-	--rr-disable-period-dump-events=true \
-	--rr-disable-scheduler-late-events=true \
-	--rr-single-issuance="${RR_SINGLE_ISSUANCE}"
+	--rr-starting-period="${RR_STARTING_PERIOD}" \
+	--rr-max-issuance-count="${RR_MAX_ISSUANCE_COUNT}" \
+	--rr-max-events-per-pass=64 \
+	--rr-event-channel-size=1024

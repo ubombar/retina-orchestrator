@@ -519,6 +519,10 @@ func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 	defer consumer.Close()
 
 	o.logger.Info("Agent connected", "agent_id", status.agentID)
+	if err := o.scheduler.Agent(status.agentID, false); err != nil {
+		o.logger.Error("Failed to include connected agent in scheduler", "agent_id", status.agentID, "err", err)
+		return
+	}
 	o.metrics.AgentQueueSize.WithLabelValues(status.agentID).Set(0)
 	o.ebus.Emit(&AgentConnectedEvent{
 		AgentID:       status.agentID,
@@ -526,6 +530,9 @@ func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 	})
 
 	defer func() {
+		if err := o.scheduler.Agent(status.agentID, true); err != nil && !errors.Is(err, context.Canceled) {
+			o.logger.Error("Failed to exclude disconnected agent from scheduler", "agent_id", status.agentID, "err", err)
+		}
 		// PDs still buffered were issued by the scheduler but never sent.
 		consumer.Close()
 		if n := consumer.Discard(); n > 0 {

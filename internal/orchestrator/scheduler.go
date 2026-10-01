@@ -20,6 +20,9 @@ type Scheduler interface {
 	// call from any goroutine.
 	Update(fie *api.ForwardingInfoElement) error
 
+	// Agent excludes an agent from issuance or includes it again.
+	Agent(agentID string, exclude bool) error
+
 	// Close stops the scheduler operations.
 	Close() error
 }

@@ -73,61 +73,38 @@ containing the full request, then replies with `{inserted_count, assigned_ids}`
 
 `ResearchScheduler.Insert` (`internal/orchestrator/research_scheduler.go`):
 
-1. Assigns the ID: `periodArray.Add(...)` returns the next index, which becomes
-   `ProbingDirectiveID`. Any ID in the request is overwritten. IDs are therefore
-   dense, starting at 0, in admission order.
-2. Admission pacing: a one-token bucket at `--rr-admission-rate` (default
-   1000/s). The call sleeps/busy-waits **while holding `bucketMu`** until its
-   slot, so a 10k batch takes about 10 s and concurrent requests are serialized.
-3. Pushes the PD onto `insertCh` (size `--rr-insert-channel-size`, 1024);
-   blocks if the scheduler goroutine is not draining.
+1. Atomically assigns a dense ID starting at 0 and overwrites the request's
+   `ProbingDirectiveID`.
+2. Copies the PD into one event and pushes it onto the scheduler event channel
+   (size `--rr-event-channel-size`, 1024); the call blocks when it is full.
 
 The record is only created later, inside the scheduler goroutine
 (`insert` in `internal/orchestrator/research_scheduler.go`):
-first issuance is scheduled at `now + X` where `X ~ U((1-β)·Μ, (1+β)·Μ)` and
-`Μ = --rr-starting-issuance-period` (default 10 s). So nothing is issued for
-roughly the first 10 s after an insert.
+the first issuance is due immediately. Every later issuance stays on the PD's
+fixed grid at `--rr-starting-period` (default 10 s).
 
 ### 3.2 Scheduling — `ResearchScheduler`
 
-All scheduler state (`records`, the `queue` min-heap ordered by `nextIssuance`,
-`addressTAT`, counters) is touched **only from the goroutine that calls
-`Next`**. `Insert` and `Update` just write to channels.
+All scheduler state is touched **only from the goroutine that calls `Next`**.
+Each agent owns a min-heap of its PDs, and agents are nodes in either an
+included or excluded linked list. `Insert`, `Update`, and agent-state changes
+write to one event channel.
 
 `Next()` (`internal/orchestrator/research_scheduler.go`):
 
-1. `drain()`: applies at most `MaxInsertDrainPerIssuance` inserts and
-   `MaxUpdateDrainPerIssuance` FIE updates (5 each by default), services the
-   status ticker, and blocks if the heap is empty.
-2. Looks at the heap root. If it is more than `BusyTolerance` away, `wait()`
-   sleeps interruptibly — still applying inserts/updates with **no quota** —
-   and returns early if an insert changed the root.
-3. Pops the root, counts it as late if `now - nextIssuance > LatenessTolerance`,
-   then either `retire`s it (`--rr-single-issuance`) or runs `compute` and
-   pushes it back.
-4. Busy-waits to the exact target time and returns the PD.
+1. Applies at most `--rr-max-events-per-pass` pending events (64 by default).
+2. Scans the included agents once and selects the earliest heap root.
+3. If it is not due, sleeps on a timer that wakes early for an event or shutdown.
+4. When due, returns the PD and reschedules it on its original fixed-period
+   grid. Missed slots are skipped, so stalls and exclusions cause at most one
+   catch-up issuance and do not accumulate phase drift.
+5. When `--rr-max-issuance-count` is nonzero, removes each PD after that many
+   issuances. Zero issues indefinitely.
 
-`compute` (`internal/orchestrator/research_scheduler.go`)
-adjusts the PD's period μ on every issuance:
-
-- **Staleness**: once the per-PD FIE history (`m = --rr-fie-history-capacity`,
-  default 6) is full, all-equivalent history → `μ·(1+α)` (slow down), otherwise
-  `μ/(1+α)` (speed up). "Equivalent" = same near and same far address, nil
-  counting as a value.
-- **Responsible probing**: per-address GCRA. For the PD's last seen near and far
-  reply addresses, `reserveAndFloor` advances that address's theoretical
-  arrival time by `1/Λ` (`--rr-impact-threshold`) and returns a minimum period;
-  the larger of the two, widened by `1/(1-β)`, is a floor on μ. This runs even
-  when the PD has never produced an FIE (addresses nil → floor 0).
-- **Clamp** to `[μmin, μmax]`.
-- Next issuance = `t + U((1-β)μ, (1+β)μ)`; `lastIssuedAt = t`.
-
-`update` (`internal/orchestrator/research_scheduler.go`)
-is what an FIE does to the scheduler: unknown PD IDs are ignored; otherwise it
-records `lastNear/lastFar`, appends to the history ring, and recomputes
-`impactDelay` as (midpoint of the agent's sent/received timestamps) −
-`lastIssuedAt`, falling back to `--rr-default-impact-delay` when that is ≤ 0.
-This mixes the agent clock with the orchestrator clock.
+Agent connection includes that agent in scheduling; disconnection excludes it.
+An excluded agent's PD heaps retain their schedules. FIE updates currently keep
+only the latest capture time and near/far reply addresses; they do not adjust
+periods.
 
 ### 3.3 Dispatch — per-agent queue
 
@@ -241,13 +218,6 @@ capturer), and pushes it into a tail-follower ring (`--event-bus-size`, 1 Mi).
 | `OrchestratorStartedEvent` / `StoppedEvent`                                       | `runAPIServer`      | on                                      |
 | `AgentConnectedEvent` / `AgentDisconnectedEvent`                                  | `agentHandler`      | on                                      |
 | `PDBulkInsertionEvent` (full PD list)                                             | bulk insert handler | on                                      |
-| `CurrentStatusEvent` every `--rr-status-interval`                                 | scheduler           | on                                      |
-| `PDInsertedEvent`, `PeriodAdjustedEvent`, `SchedulerLateEvent`, `PeriodDumpEvent` | scheduler           | **off** (`--rr-disable-*` default true) |
-
-`CurrentStatusEvent` is the main health signal: cumulative insertions /
-issuances / updates, realized issuance and update rates, channel occupancies,
-late count, clamp counts. It is only emitted from inside `drain`/`wait`, i.e.
-only while the scheduler goroutine is cycling.
 
 ## 6. Metrics
 

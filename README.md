@@ -44,7 +44,7 @@ groups are:
   `--pd-queue-size`, `--pd-push-timeout`.
 - HTTP streaming: `--api-addr`, `--ring-buffer-size`,
   `--stream-start-from-earliest`.
-- Responsible-reprobing scheduler: all `--rr-*` options.
+- Fixed-period research scheduler: all `--rr-*` options.
 - DuckDB capture: all `--capturer-*` options. Set
   `--capturer-enabled=false` to disable capture.
 - Events and observability: `--events-dir`, `--event-bus-size`,
