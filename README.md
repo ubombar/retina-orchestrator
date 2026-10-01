@@ -1,63 +1,66 @@
 # Retina Orchestrator
 
-Retina Orchestrator admits and schedules Probing Directives (PDs), dispatches
-them to authenticated Retina agents, receives Forwarding Information Elements
-(FIEs), and exposes FIE and scheduler-event streams over HTTP.
+Retina Orchestrator accepts Probing Directives (PDs) over HTTP, schedules them, sends them to authenticated Retina agents, and captures the Forwarding Information Elements (FIEs) the agents send back into DuckDB files.
 
-This checkout is a research branch. Its scheduler and operational flags may
-differ from released Retina versions.
+This checkout is a research branch. Its code lives in `internal/retina` and its flags differ from released Retina versions.
 
 ## Build and test
 
-The module requires Go 1.26.5.
+The module requires Go 1.26.5 and cgo, which the DuckDB capturer needs.
 
 ```bash
 make build
+```
+
+```bash
 make test
 ```
 
-`make build` regenerates Swagger documentation, formats and lints the project,
-then writes `./retina-orchestrator`. To compile without those extra steps:
+`make build` formats and lints the project, then writes `./retina-orchestrator`. To compile without those steps:
 
 ```bash
 go build -o retina-orchestrator .
 ```
 
+The `Dockerfile` builds the same binary into an image that runs as the unprivileged user `retina` in `/app`.
+
 ## Running
 
-`RETINA_SECRET` is the shared agent secret and is configured only through the
-environment. Empty secrets disable authentication; production deployments
-should set one.
+`RETINA_SECRET` is the shared agent secret and is read from the environment only. An empty secret accepts agents that send an empty secret.
 
 ```bash
 RETINA_SECRET='replace-with-a-secret' ./retina-orchestrator \
-  --agent-addr=0.0.0.0:50050 \
-  --api-addr=0.0.0.0:8080 \
-  --metrics-addr=0.0.0.0:9312 \
-  --fie-filter-policy=any
+  --agent-addr=:50050 \
+  --api-addr=:8080 \
+  --capturer-capture-dir=./capture
 ```
 
-Use `./retina-orchestrator --help` for the authoritative flag list. Important
-groups are:
+`./retina-orchestrator --help` is the authoritative flag list. All other settings come from flags; there are no environment fallbacks.
 
-- Agent transport and buffering: `--agent-addr`, `--agent-buffer-length`,
-  `--pd-queue-size`, `--pd-push-timeout`.
-- HTTP streaming: `--api-addr`, `--ring-buffer-size`,
-  `--stream-start-from-earliest`.
-- Fixed-period research scheduler: all `--rr-*` options.
-- DuckDB capture: all `--capturer-*` options. Set
-  `--capturer-enabled=false` to disable capture.
-- Events and observability: `--events-dir`, `--event-bus-size`,
-  `--metrics-addr`, and `--log-level`.
-
-Every flag has a corresponding `RETINA_*` environment default. Command-line
-flags take precedence over environment variables.
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--agent-addr` | `localhost:50050` | Listening address for agent connections |
+| `--agent-handshake-timeout` | `5s` | Time an agent has to complete the handshake |
+| `--agent-keepalive-idle` | `30s` | Idle time before TCP keepalive probes are sent |
+| `--agent-keepalive-interval` | `10s` | Time between keepalive probes |
+| `--agent-keepalive-count` | `3` | Unanswered probes before the connection is closed |
+| `--agent-write-buffer-size` | `65536` | Per-agent buffer PDs are written to before being sent |
+| `--agent-flush-period` | `100ms` | Interval at which buffered PDs are sent; a PD is delayed by at most this long |
+| `--api-addr` | `localhost:8080` | Listening address for the HTTP API |
+| `--api-read-header-timeout` | `5s` | Timeout for reading HTTP request headers |
+| `--scheduler-starting-period` | `10s` | Issuance period of every PD, and the delay before its first issuance |
+| `--scheduler-max-issuance-count` | `0` | Issuances per PD before it leaves the schedule; 0 is indefinitely |
+| `--scheduler-event-queue-size` | `1024` | Size of the scheduler event queue |
+| `--capturer-capture-dir` | `./capture` | Directory for the DuckDB capture files |
+| `--capturer-allow-non-empty-capture-dir` | `false` | Allow starting with files already in the capture directory |
+| `--capturer-rotation-interval` | `1h` | Time span covered by one capture file, at most 18h |
+| `--capturer-batch-size` | `100000` | FIEs appended before the capture file is flushed |
+| `--capturer-queue-size` | `200000` | Received FIEs that may wait to be captured |
+| `--capturer-flush-period` | `1s` | Interval between periodic flushes of the capture file |
 
 ## Agent wire protocol
 
-Each agent maintains one bidirectional TCP connection. Authentication is the
-existing newline-delimited JSON exchange. After successful authentication, the
-connection switches to headerless CSV and every record ends in `\n`.
+Each agent keeps one bidirectional TCP connection. The handshake is one JSON line each way (`AuthRequest`, `AuthResponse` from `retina-commons`). After it, the connection carries headerless CSV, one record per line.
 
 PD, orchestrator to agent:
 
@@ -65,8 +68,7 @@ PD, orchestrator to agent:
 probing_directive_id,"destination_address",near_ttl,protocol_number,first_half_word,second_half_word
 ```
 
-The final two values are ICMP/ICMPv6 correlation half-words or UDP source and
-destination ports.
+The last two values are the ICMP or ICMPv6 correlation half-words, or the UDP source and destination ports.
 
 FIE, agent to orchestrator:
 
@@ -74,62 +76,37 @@ FIE, agent to orchestrator:
 probing_directive_id,unix_capture_timestamp,"near_address",near_capture_delta,"far_address",far_capture_delta
 ```
 
-Addresses are always quoted. A missing near or far observation is encoded as
-`"",0`. Deltas are non-negative whole seconds from the FIE production timestamp
-to the corresponding received timestamp. Because the compact representation
-does not carry a sent timestamp, the orchestrator reconstructs sent and received
-timestamps as equal (the zero-RTT approximation).
+Addresses are always quoted. A missing near or far reply is `"",0`. A delta is the whole seconds between that reply and the capture timestamp. The record carries no sent timestamps.
 
-The data-phase protocol is a coordinated cutover: it does not negotiate JSON
-versus CSV. Agent and orchestrator versions must therefore be upgraded together.
+PD IDs are 32-bit. There is no protocol negotiation, so agent and orchestrator must be upgraded together. The matching agent is `retina-agent` on `research-v1.0.0`, and both use `retina-commons` on `research-v1.0.0`.
 
 ## HTTP API
 
-- `POST /api/v1/pds` bulk-admits PDs using JSON:
-  `{"probing_directives":[...]}`. IDs supplied by clients are overwritten by
-  scheduler-assigned IDs.
-- `GET /api/v1/stream` streams sequenced FIEs as NDJSON.
-- `GET /api/v1/sse` streams scheduler events as NDJSON. Despite the historical
-  route name, it does not use Server-Sent Events framing.
-- `GET /api/v1/swagger/` serves Swagger UI.
+`POST /api/v1/pds` inserts PDs. The body is `{"probing_directives":[...]}` with `ProbingDirective` objects from `retina-commons`. The whole request is inserted as one batch: if any PD is invalid, the request is rejected with 400 and nothing is inserted. IDs supplied by the client are ignored.
 
-`scripts/bulk_push.sh` batches a PD JSONL file into calls to `POST /api/v1/pds`.
-JSONL here is an HTTP input-file format and is unrelated to the CSV agent wire
-protocol.
+The response is `{"inserted_count":N,"first_id":X}`. The inserted PDs have consecutive IDs starting at `first_id`, in request order.
 
-## Behavior and backpressure
+`scripts/bulk_push.sh` splits a PD JSONL file into such requests. There is no other endpoint.
 
-- The research scheduler controls admission and reissuance periods.
-- Each connected agent has a queue sized by `--pd-queue-size`.
-- When that queue is full, dispatch waits up to `--pd-push-timeout`. A timeout,
-  missing agent, or disconnect is counted by `pds_dropped_total` with a reason.
-- `--fie-filter-policy=any|one|both` controls which received FIEs proceed to
-  capture and HTTP streaming. Every received FIE still updates the scheduler.
-- TCP keepalive detects unreachable peers. PD writes have a five-second
-  deadline; FIE reads are intentionally unbounded while the connection is live.
-- SIGINT and SIGTERM initiate graceful shutdown.
+## Behaviour
 
-## Observability
+- A PD is first issued one starting period after it is inserted, and again one period after each issuance.
+- Each agent pulls its own PDs. An agent that is slow or not reading delays only its own PDs; it is never disconnected for that, and nothing is dropped. Its overdue PDs go out in order, each once, when it catches up.
+- PDs of an agent that is not connected wait in the schedule and are issued when it connects.
+- A second connection with an agent ID that is already connected is closed after the handshake.
+- Every received FIE is captured. When the capture queue is full, the orchestrator stops reading from the agents, which slows them down.
+- A capturer error stops the orchestrator.
+- SIGINT and SIGTERM shut down cleanly: queued FIEs are written and the capture file is closed.
 
-Prometheus metrics and Go runtime profiles are exposed on `--metrics-addr`:
+See [DOCS.md](DOCS.md) for how it works inside, and for measured throughput.
 
-- `/metrics`
-- `/debug/pprof/`
+## Scripts
 
-Metrics cover agent connections, authentication, PD dispatch/drop reasons,
-FIE receipt and streaming, queue sizes, scheduler behavior, capture, and stream
-lag. See `internal/orchestrator/metrics.go` for the exact definitions.
+- `scripts/orch.sh` starts the orchestrator with the research settings and captures into a new directory under `./captures/` on each start.
+- `scripts/bulk_push.sh` and `scripts/insert_pds.sh` load a PD JSONL file through the HTTP API.
+- `scripts/memlog.sh` logs the process memory of a running orchestrator.
 
-For implementation details and operational caveats, see [DOCS.md](DOCS.md).
-
-## Development helpers
-
-- `scripts/orch.sh` is an opinionated research configuration and writes capture
-  output below `./captures/`.
-- `scripts/bulk_push.sh` and `scripts/insert_pds.sh` load PD JSONL through HTTP.
-- `scripts/mock_agent.sh` still implements the legacy JSON data phase and is not
-  compatible with the current CSV protocol. Use the real Retina agent with
-  `--prober-type=mock` for end-to-end testing without network probes.
+For end-to-end tests without network probes, run the real agent with `--prober-type=mock`.
 
 ## License
 
