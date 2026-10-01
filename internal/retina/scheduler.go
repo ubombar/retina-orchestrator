@@ -72,8 +72,11 @@ type issuance struct {
 // agent ID is seen, by an inserted PD or by a connecting agent, and is never
 // removed.
 type agentNode struct {
-	pds  []PD
-	heap pdHeap
+	// agentID is the one copy of the agent ID that all of the node's PDs
+	// share, instead of each keeping the string it arrived with.
+	agentID string
+	pds     []PD
+	heap    pdHeap
 	// issuer is the open issuer of this agent, nil while it has none.
 	issuer *Issuer
 	// waiting is set while the issuer has asked for a PD and the heap was
@@ -224,7 +227,9 @@ func (s *Scheduler) apply(ev *event) {
 		due := s.now() + int64(s.config.StartingPeriod)
 		for i := range ev.pds {
 			node := s.node(ev.pds[i].AgentID)
-			node.pds = append(node.pds, ev.pds[i])
+			pd := ev.pds[i]
+			pd.AgentID = node.agentID
+			node.pds = append(node.pds, pd)
 			node.heap.push(heapEntry{due: due, index: len(node.pds) - 1})
 			if node.waiting {
 				node.waiting = false
@@ -269,7 +274,7 @@ func (s *Scheduler) apply(ev *event) {
 func (s *Scheduler) node(agentID string) *agentNode {
 	node, ok := s.nodes[agentID]
 	if !ok {
-		node = &agentNode{}
+		node = &agentNode{agentID: agentID}
 		s.nodes[agentID] = node
 	}
 	return node

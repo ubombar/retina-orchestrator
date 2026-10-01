@@ -9,8 +9,10 @@ import (
 	"math"
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 const testPeriod = 100 * time.Millisecond
@@ -157,6 +159,38 @@ func TestScheduler_InsertFailsWhenIDsRunOut(t *testing.T) {
 	}
 	if _, err := s.Insert([]PD{pd}); err == nil {
 		t.Fatal("expected an error when no IDs are left")
+	}
+}
+
+func TestScheduler_PDsShareTheAgentIDString(t *testing.T) {
+	s, _ := startScheduler(t, 0)
+	issuer := newIssuer(t, s, "a1")
+	addr := netip.MustParseAddr("192.0.2.1")
+
+	// Each PD arrives with its own copy of the agent ID, as from a JSON request.
+	if _, err := s.Insert([]PD{
+		{AgentID: strings.Clone("a1"), Destination: addr},
+		{AgentID: strings.Clone("a1"), Destination: addr},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	first, err := issuer.Issue(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := issuer.Issue(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.AgentID != "a1" || second.AgentID != "a1" {
+		t.Fatalf("agent IDs: got %q and %q, want a1", first.AgentID, second.AgentID)
+	}
+	// Comparing the data pointers is the only way to tell one string from two equal ones.
+	if unsafe.StringData(first.AgentID) != unsafe.StringData(second.AgentID) { //nolint:gosec // G103: pointers are only compared
+		t.Fatal("the two PDs do not share one agent ID string")
 	}
 }
 
