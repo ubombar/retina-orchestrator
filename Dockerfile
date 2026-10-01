@@ -7,13 +7,8 @@ RUN go mod download
 
 COPY . .
 
-# docs/ must exist before swag init runs; the .gitkeep ensures the directory
-# is tracked in git but swag will overwrite the generated files at build time.
-RUN go install github.com/swaggo/swag/cmd/swag@v1.16.6 && \
-    swag init --parseDependency --parseInternal \
-              -g main.go \
-              --output docs && \
-    CGO_ENABLED=0 GOOS=linux \
+# cgo is required by the DuckDB capturer.
+RUN CGO_ENABLED=1 GOOS=linux \
     go build -trimpath -ldflags="-s -w" \
     -o retina-orchestrator .
 
@@ -25,6 +20,12 @@ LABEL  org.opencontainers.image.authors="Dioptra <contact@dioptra.io>"
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# The orchestrator runs as an unprivileged user that owns its working
+# directory, where the capture files are written by default.
+RUN useradd --system --user-group retina \
+    && mkdir /app \
+    && chown retina:retina /app
 
 WORKDIR /app
 COPY --from=builder /build/retina-orchestrator .
