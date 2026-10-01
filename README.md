@@ -1,135 +1,136 @@
-# ⚠️ Research Branch
+# Retina Orchestrator
 
-**This is a research branch.** The features implemented here might not be available in the upcoming releases of Retina.
+Retina Orchestrator admits and schedules Probing Directives (PDs), dispatches
+them to authenticated Retina agents, receives Forwarding Information Elements
+(FIEs), and exposes FIE and scheduler-event streams over HTTP.
 
-### Features in this branch
+This checkout is a research branch. Its scheduler and operational flags may
+differ from released Retina versions.
 
-- SSE endpoint now streams plain JSON (single-line) instead of SSE-formatted events.
-- SSE endpoint used for streaming the events in the orchestrator.
-- `--max-cycles` flag determines the maximum number of cycles the orchestrator is going to run.
-- `--fie-filter-policy` flag defaults to `any` (instead of `both`) to stream FIEs with any response address.
+## Build and test
 
----
-
-# retina-orchestrator
-
-`retina-orchestrator` schedules Probing Directives (PDs) to connected agents, collects the resulting Forwarding Info Elements (FIEs), and streams them to HTTP clients.
-
-**Part of the Retina system:**
-- **Generator**: Creates probing directives
-- **Orchestrator**: Distributes directives to agents, collects FIEs (this component)
-- **Agent**: Executes network probes
-
-## Build
+The module requires Go 1.26.5.
 
 ```bash
 make build
-```
-
-To build only the binary:
-```bash
-make build
-```
-
-To generate Swagger documentation:
-```bash
-make docs
-```
-
-To clean:
-```bash
-make clean
-```
-
-## Test
-
-```bash
 make test
 ```
 
-## Usage
+`make build` regenerates Swagger documentation, formats and lints the project,
+then writes `./retina-orchestrator`. To compile without those extra steps:
 
 ```bash
-./retina-orchestrator [flags]
+go build -o retina-orchestrator .
 ```
 
-### Example
+## Running
+
+`RETINA_SECRET` is the shared agent secret and is configured only through the
+environment. Empty secrets disable authentication; production deployments
+should set one.
 
 ```bash
-RETINA_SECRET=mysecret ./retina-orchestrator \
-  --agent-addr=0.0.0.0:9100 \
+RETINA_SECRET='replace-with-a-secret' ./retina-orchestrator \
+  --agent-addr=0.0.0.0:50050 \
   --api-addr=0.0.0.0:8080 \
-  --pd-path=pds.jsonl \
-  --issuance-rate=1000 \
-  --impact-threshold=2.0 \
-  --log-level=info
+  --metrics-addr=0.0.0.0:9312 \
+  --fie-filter-policy=any
 ```
 
-## Flags
+Use `./retina-orchestrator --help` for the authoritative flag list. Important
+groups are:
 
-| Flag                        | Default          | Description                                           |
-| --------------------------- | ---------------- | ----------------------------------------------------- |
-| `--api-addr`                | `localhost:8080` | TCP address for the HTTP API server (host:port)       |
-| `--agent-addr`              | `localhost:50050`| TCP address for agent connections (host:port)         |
-| `--pd-queue-size`           | `100`            | Size of the per-agent PD queue buffer                 |
-| `--ring-buffer-size`        | `100`            | Size of the ring buffer                               |
-| `--pd-path`                 | `""`             | Path to the JSONL file containing Probing Directives  |
-| `--issuance-rate`           | `1.0`            | Target PD issuance rate in PDs per second             |
-| `--impact-threshold`        | `1.0`            | Maximum directives allowed to impact a single address |
-| `--seed`                    | `42`             | Seed for the random scheduler                         |
-| `--api-read-header-timeout` | `5s`             | Timeout for reading HTTP request headers              |
-| `--metrics-addr`            | `:9312`          | Address to expose Prometheus metrics on              |
-| `--log-level`               | `info`           | Log level (`debug`, `info`, `warn`, `error`)          |
-| `--fie-filter-policy`       | `any`            | FIE filtering policy: `any`, `one`, or `both` (controls which FIEs are streamed, checks the response addresses) |
+- Agent transport and buffering: `--agent-addr`, `--agent-buffer-length`,
+  `--pd-queue-size`, `--pd-push-timeout`.
+- HTTP streaming: `--api-addr`, `--ring-buffer-size`,
+  `--stream-start-from-earliest`.
+- Responsible-reprobing scheduler: all `--rr-*` options.
+- DuckDB capture: all `--capturer-*` options. Set
+  `--capturer-enabled=false` to disable capture.
+- Events and observability: `--events-dir`, `--event-bus-size`,
+  `--metrics-addr`, and `--log-level`.
 
+Every flag has a corresponding `RETINA_*` environment default. Command-line
+flags take precedence over environment variables.
 
-## Environment Variables
+## Agent wire protocol
 
-All flags can be configured via environment variables. These act as defaults and are overridden by CLI flags.
+Each agent maintains one bidirectional TCP connection. Authentication is the
+existing newline-delimited JSON exchange. After successful authentication, the
+connection switches to headerless CSV and every record ends in `\n`.
 
-Precedence:
+PD, orchestrator to agent:
 
+```text
+probing_directive_id,"destination_address",near_ttl,protocol_number,first_half_word,second_half_word
 ```
-CLI flags > environment variables > hardcoded defaults
+
+The final two values are ICMP/ICMPv6 correlation half-words or UDP source and
+destination ports.
+
+FIE, agent to orchestrator:
+
+```text
+probing_directive_id,unix_capture_timestamp,"near_address",near_capture_delta,"far_address",far_capture_delta
 ```
 
-| Variable                         | Default           | Description                                          |
-| -------------------------------- | ----------------- | ---------------------------------------------------- |
-| `RETINA_SECRET`                  | *                 | Shared secret for agent authentication, required     |
-| `RETINA_API_ADDR`                | `localhost:8080`  | TCP address for the HTTP API server                  |
-| `RETINA_AGENT_ADDR`              | `localhost:50050` | TCP address for agent connections                    |
-| `RETINA_PD_QUEUE_SIZE`           | `100`             | Size of the per-agent PD queue buffer                |
-| `RETINA_RING_BUFFER_SIZE`        | `100`             | Size of the ring buffer used in streaming FIEs       |
-| `RETINA_PD_PATH`                 | `""`              | Path to the JSONL file containing Probing Directives |
-| `RETINA_ISSUANCE_RATE`           | `1.0`             | Target PD issuance rate in PDs per second            |
-| `RETINA_IMPACT_THRESHOLD`        | `1.0`             | Maximum directives allowed per address               |
-| `RETINA_SEED`                    | `42`              | Seed for the random scheduler                        |
-| `RETINA_API_READ_HEADER_TIMEOUT` | `5s`              | Timeout for reading HTTP request headers             |
-| `RETINA_METRICS_ADDR`            | `:9312`           | Address to expose Prometheus metrics on              |
-| `RETINA_LOG_LEVEL`               | `info`            | Log level (`debug`, `info`, `warn`, `error`)         |
-| `RETINA_FIE_FILTER_POLICY`       | `any`            | Filtering policy for FIEs (`any`, `one`, `both`)     |
+Addresses are always quoted. A missing near or far observation is encoded as
+`"",0`. Deltas are non-negative whole seconds from the FIE production timestamp
+to the corresponding received timestamp. Because the compact representation
+does not carry a sent timestamp, the orchestrator reconstructs sent and received
+timestamps as equal (the zero-RTT approximation).
 
-## Behavior
+The data-phase protocol is a coordinated cutover: it does not negotiate JSON
+versus CSV. Agent and orchestrator versions must therefore be upgraded together.
 
-- The orchestrator connects to agents over TCP using newline-delimited JSON.
-- Agents authenticate using the `RETINA_SECRET` environment variable before receiving directives.
-- PDs are scheduled using a responsible probing algorithm that limits the number of concurrent directives impacting any single address.
-- FIEs received from agents are streamed to HTTP clients via the `/stream` endpoint as NDJSON.
-- Swagger UI is available at `/swagger/index.html` when the server is running.
-- Logs are written to stdout in JSON format, compatible with Loki/Grafana pipelines.
-- The program handles `SIGINT` and `SIGTERM` for graceful shutdown.
+## HTTP API
+
+- `POST /api/v1/pds` bulk-admits PDs using JSON:
+  `{"probing_directives":[...]}`. IDs supplied by clients are overwritten by
+  scheduler-assigned IDs.
+- `GET /api/v1/stream` streams sequenced FIEs as NDJSON.
+- `GET /api/v1/sse` streams scheduler events as NDJSON. Despite the historical
+  route name, it does not use Server-Sent Events framing.
+- `GET /api/v1/swagger/` serves Swagger UI.
+
+`scripts/bulk_push.sh` batches a PD JSONL file into calls to `POST /api/v1/pds`.
+JSONL here is an HTTP input-file format and is unrelated to the CSV agent wire
+protocol.
+
+## Behavior and backpressure
+
+- The research scheduler controls admission and reissuance periods.
+- Each connected agent has a queue sized by `--pd-queue-size`.
+- When that queue is full, dispatch waits up to `--pd-push-timeout`. A timeout,
+  missing agent, or disconnect is counted by `pds_dropped_total` with a reason.
+- `--fie-filter-policy=any|one|both` controls which received FIEs proceed to
+  capture and HTTP streaming. Every received FIE still updates the scheduler.
+- TCP keepalive detects unreachable peers. PD writes have a five-second
+  deadline; FIE reads are intentionally unbounded while the connection is live.
+- SIGINT and SIGTERM initiate graceful shutdown.
 
 ## Observability
 
-Metrics are exposed at `--metrics-addr` (default `:9312`) in Prometheus format, covering:
+Prometheus metrics and Go runtime profiles are exposed on `--metrics-addr`:
 
-- **Agent connectivity**: agents currently connected, authentication failures, disconnections by agent ID
-- **Pipeline throughput**: probing directives sent and FIEs received, queue size per agent, labelled by agent ID
-- **PD scheduling**: total directives loaded, cycle duration, cycles completed, directives skipped by the responsible probing algorithm
-- **Streaming endpoint**: connected HTTP clients, total connections/disconnections by reason, FIEs streamed, stream lag distribution
+- `/metrics`
+- `/debug/pprof/`
 
-See `internal/orchestrator/metrics.go` for the full list.
+Metrics cover agent connections, authentication, PD dispatch/drop reasons,
+FIE receipt and streaming, queue sizes, scheduler behavior, capture, and stream
+lag. See `internal/orchestrator/metrics.go` for the exact definitions.
+
+For implementation details and operational caveats, see [DOCS.md](DOCS.md).
+
+## Development helpers
+
+- `scripts/orch.sh` is an opinionated research configuration and writes capture
+  output below `./captures/`.
+- `scripts/bulk_push.sh` and `scripts/insert_pds.sh` load PD JSONL through HTTP.
+- `scripts/mock_agent.sh` still implements the legacy JSON data phase and is not
+  compatible with the current CSV protocol. Use the real Retina agent with
+  `--prober-type=mock` for end-to-end testing without network probes.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details
+MIT License — see [LICENSE](LICENSE).

@@ -1,9 +1,7 @@
 # retina-orchestrator — how it works
 
-Internal documentation of the code as it stands on the `research` branch. The
-`README.md` is partly stale (it still lists `--pd-path`, `--issuance-rate`,
-`--seed`, `--max-cycles`, none of which exist any more); `main.go` is the source
-of truth for flags.
+Internal documentation of the code as it stands on the current research
+branch. `main.go` and `--help` remain the source of truth for flags.
 
 The agent side is documented in `retina-agent/DOCS.md`.
 
@@ -22,7 +20,7 @@ The agent side is documented in `retina-agent/DOCS.md`.
                            │  pdQueue[agentID]    │           │──► DuckDB capture files
                            │      │               │           │──► events-*.jsonl
                            └──────┼───────────────┼───────────┘
-                         PD (JSON line)        FIE (JSON line)
+                         PD (CSV line)         FIE (CSV line)
                                   ▼               │
                            ┌──────────────────────────────────┐
                            │   agent  (one TCP conn each)     │
@@ -31,6 +29,11 @@ The agent side is documented in `retina-agent/DOCS.md`.
                            │           caracal subprocess     │
                            └──────────────────────────────────┘
 ```
+
+The JSON authentication request/response remains unchanged. After it succeeds,
+PD records are `id,"destination",near_ttl,protocol,first_half_word,second_half_word`
+and FIE records are
+`id,capture_unix,"near_address",near_delta,"far_address",far_delta`.
 
 - **Probing Directive (PD)**: "agent X, probe destination D with protocol P at
   TTL `near_ttl` and `near_ttl+1`". Carries the flow identifier (ICMP half
@@ -46,7 +49,7 @@ The agent side is documented in `retina-agent/DOCS.md`.
 Prometheus server on `--metrics-addr` (default `:9312`), builds the
 `Orchestrator` and calls `Run`. `RETINA_SECRET` is env-only.
 
-`Orchestrator.Run` ([orchestrator.go:205](internal/orchestrator/orchestrator.go:205))
+`Orchestrator.Run` (`internal/orchestrator/orchestrator.go`)
 starts five goroutines in one `errgroup`; any of them returning an error
 cancels the shared context and stops the whole process:
 
@@ -54,7 +57,7 @@ cancels the shared context and stops the whole process:
 | ---------------- | ----------------------------------------------------------------------- |
 | `runAPIServer`   | HTTP server on `--api-addr`; emits `OrchestratorStarted/Stopped` events |
 | `runAgentServer` | TCP listener on `--agent-addr`, one goroutine per agent connection      |
-| `runScheduler`   | Loop: `scheduler.Next()` → `pdQueue.TryPush(pd.AgentID, pd)`            |
+| `runScheduler`   | Loop: `scheduler.Next()` → bounded-wait dispatch to the agent queue      |
 | `runCapturer`    | Drains `captureCh` into DuckDB, plus a periodic flush ticker            |
 | closer           | On ctx done, `scheduler.Close()` (which unblocks `Next`)                |
 
@@ -62,13 +65,13 @@ cancels the shared context and stops the whole process:
 
 ### 3.1 Insertion — `POST /api/v1/pds`
 
-[api_server.go:213](internal/orchestrator/api_server.go:213). Body is
+The handler in `internal/orchestrator/api_server.go` accepts a body of
 `{"probing_directives":[...]}`. The handler calls `scheduler.Insert` for every
 PD **sequentially and synchronously**, then emits one `PDBulkInsertionEvent`
 containing the full request, then replies with `{inserted_count, assigned_ids}`
 (HTTP 500 if it aborted part-way).
 
-`ResearchScheduler.Insert` ([research_scheduler.go:442](internal/orchestrator/research_scheduler.go:442)):
+`ResearchScheduler.Insert` (`internal/orchestrator/research_scheduler.go`):
 
 1. Assigns the ID: `periodArray.Add(...)` returns the next index, which becomes
    `ProbingDirectiveID`. Any ID in the request is overwritten. IDs are therefore
@@ -80,7 +83,7 @@ containing the full request, then replies with `{inserted_count, assigned_ids}`
    blocks if the scheduler goroutine is not draining.
 
 The record is only created later, inside the scheduler goroutine
-(`insert`, [research_scheduler.go:703](internal/orchestrator/research_scheduler.go:703)):
+(`insert` in `internal/orchestrator/research_scheduler.go`):
 first issuance is scheduled at `now + X` where `X ~ U((1-β)·Μ, (1+β)·Μ)` and
 `Μ = --rr-starting-issuance-period` (default 10 s). So nothing is issued for
 roughly the first 10 s after an insert.
@@ -91,7 +94,7 @@ All scheduler state (`records`, the `queue` min-heap ordered by `nextIssuance`,
 `addressTAT`, counters) is touched **only from the goroutine that calls
 `Next`**. `Insert` and `Update` just write to channels.
 
-`Next()` ([research_scheduler.go:479](internal/orchestrator/research_scheduler.go:479)):
+`Next()` (`internal/orchestrator/research_scheduler.go`):
 
 1. `drain()`: applies at most `MaxInsertDrainPerIssuance` inserts and
    `MaxUpdateDrainPerIssuance` FIE updates (5 each by default), services the
@@ -104,7 +107,7 @@ All scheduler state (`records`, the `queue` min-heap ordered by `nextIssuance`,
    pushes it back.
 4. Busy-waits to the exact target time and returns the PD.
 
-`compute` ([research_scheduler.go:842](internal/orchestrator/research_scheduler.go:842))
+`compute` (`internal/orchestrator/research_scheduler.go`)
 adjusts the PD's period μ on every issuance:
 
 - **Staleness**: once the per-PD FIE history (`m = --rr-fie-history-capacity`,
@@ -119,7 +122,7 @@ adjusts the PD's period μ on every issuance:
 - **Clamp** to `[μmin, μmax]`.
 - Next issuance = `t + U((1-β)μ, (1+β)μ)`; `lastIssuedAt = t`.
 
-`update` ([research_scheduler.go:747](internal/orchestrator/research_scheduler.go:747))
+`update` (`internal/orchestrator/research_scheduler.go`)
 is what an FIE does to the scheduler: unknown PD IDs are ignored; otherwise it
 records `lastNear/lastFar`, appends to the history ring, and recomputes
 `impactDelay` as (midpoint of the agent's sent/received timestamps) −
@@ -128,18 +131,16 @@ This mixes the agent clock with the orchestrator clock.
 
 ### 3.3 Dispatch — per-agent queue
 
-`runScheduler` ([orchestrator.go:288](internal/orchestrator/orchestrator.go:288))
-calls `pdQueue.TryPush(pd.AgentID, pd)`. `structures.Queue` is a map of
-agent ID → buffered channel of size `--pd-queue-size` (default 100). The push
-is **non-blocking**; the PD is dropped when
+`runScheduler` (`internal/orchestrator/orchestrator.go`) calls `dispatch`.
+`structures.Queue` is a map of agent ID to a buffered queue of size
+`--pd-queue-size` (default 100). Dispatch first tries a non-blocking push. When
+the queue is full it waits for room for up to `--pd-push-timeout` (default 1 s;
+zero waits until room, cancellation, or disconnect).
 
-- no agent with that ID is currently connected, or
-- that agent's channel is full.
-
-Both cases produce only a `Debug` log ("PD dropped: no queue for agent" — the
-message is the same for a full buffer) and no metric. The scheduler has already
-counted the issuance, set `lastIssuedAt` and reserved the address slots, so
-from its point of view the PD was issued.
+A PD is dropped when the agent is not connected, disconnects while dispatch is
+waiting, or the push timeout expires. `pds_dropped_total{agent_id,reason}` uses
+reasons `not_connected`, `disconnected`, and `timeout`; warning logs are rate
+limited. The scheduler has already counted the issuance before dispatch.
 
 ### 3.4 Agent connection
 
@@ -149,7 +150,18 @@ a 5 s deadline: read one `AuthRequest` line, compare `Secret` to
 `RETINA_SECRET` (plain equality; both empty means no auth), write
 `AuthResponse`, clear deadlines.
 
-`agentHandler` ([orchestrator.go:438](internal/orchestrator/orchestrator.go:438))
+The handshake is newline-delimited JSON. The connection then switches to CSV:
+
+```text
+PD:  id,"destination",near_ttl,protocol,first_half_word,second_half_word
+FIE: id,capture_unix,"near_address",near_delta,"far_address",far_delta
+```
+
+Blank boundary lines are ignored because the JSON decoder may leave its final
+newline in the shared buffered reader. No protocol version is negotiated, so
+agents and orchestrators must be upgraded together.
+
+`agentHandler` (`internal/orchestrator/orchestrator.go`)
 then registers a queue consumer under the agent ID. If that ID is already
 registered the new connection is closed right after a _successful_ auth
 response ("Agent already connected, rejecting"). Otherwise three goroutines run
@@ -165,6 +177,12 @@ channel is discarded.
 ## 4. FIE path (upstream)
 
 For each FIE line received from an agent, in order:
+
+The CSV decoder restores the authenticated agent ID, production timestamp, and
+near/far reply information. Each non-empty observation's received timestamp is
+`capture_unix - delta`; its sent timestamp is set equal to received timestamp
+because the compact wire record does not contain RTT information. Destination,
+source, protocol, and IP-version fields are not carried in the FIE row.
 
 1. `FIEsReceivedTotal{agent_id}` is incremented.
 2. `scheduler.Update(fie)` — a **blocking** send on `updateCh` (size 1024).
@@ -250,11 +268,12 @@ flushes and checkpoints.
 
 Observations from reading the code, not confirmed bugs:
 
-- **Silent PD loss at dispatch** (§3.3): disconnected agent or a full 100-slot
-  queue drops the PD at `Debug` level while the scheduler counts it as issued.
-  `cumulative_issuances` can exceed `pds_sent_total` with no other trace.
+- **PD loss after scheduling** (§3.3): dispatch can still drop an already
+  scheduled PD when the agent is absent, disconnects, or remains backpressured
+  through `--pd-push-timeout`. The loss is visible in
+  `pds_dropped_total{reason=...}` and rate-limited warnings.
 - **`Insert` is documented as goroutine-safe but `AtomicFloat64Array.Add` is
-  not** ([atomic_array.go:38](internal/orchestrator/structures/atomic_array.go:38),
+  not** (`internal/orchestrator/structures/atomic_array.go`,
   called before `bucketMu` is taken). Two concurrent `POST /pds` requests can
   hand out the same ID or lose an entry.
 - **Bulk insert reporting**: the log line and `PDBulkInsertionEvent` use the
@@ -283,12 +302,12 @@ Observations from reading the code, not confirmed bugs:
 | --------------------------------------------- | ---------------------------------------------------------------------- |
 | `main.go`                                     | flags, metrics server, wiring                                          |
 | `internal/orchestrator/orchestrator.go`       | `Config`, `Run`, agent/stream/SSE handlers                             |
-| `internal/orchestrator/agent_server.go`       | TCP listener, handshake, NDJSON send/receive                           |
+| `internal/orchestrator/agent_server.go`       | TCP listener, JSON handshake, compact CSV PD/FIE transport             |
 | `internal/orchestrator/api_server.go`         | HTTP routes, bulk insert                                               |
 | `internal/orchestrator/research_scheduler.go` | scheduler (DSD v1.2)                                                   |
 | `internal/orchestrator/scheduler.go`          | `Scheduler` interface                                                  |
 | `internal/orchestrator/event_bus.go`          | event types, bus, JSONL persistence                                    |
 | `internal/orchestrator/capturer.go`           | DuckDB capture                                                         |
 | `internal/orchestrator/structures/`           | `Queue`, `RingBuffer`, `AtomicFloat64Array`                            |
-| `scripts/`                                    | `bulk_push.sh` (batched POST), `mock_agent.sh`, `orch.sh`, `memlog.sh` |
+| `scripts/`                                    | bulk loaders, run/monitor helpers, and a legacy JSON mock agent        |
 | `test/`                                       | sample PD JSONL files                                                  |

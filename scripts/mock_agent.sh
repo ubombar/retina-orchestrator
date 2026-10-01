@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Mock Retina agent.
+# Legacy mock Retina agent.
 #
-# Speaks the newline-delimited JSON protocol expected by the orchestrator's
-# agentServer: authenticate, then reply to every ProbingDirective with a
-# ForwardingInfoElement derived from that directive.
+# This script speaks the former all-JSON protocol and is not compatible with
+# the current compact-CSV data phase. Use the real retina-agent binary with
+# --prober-type=mock for current end-to-end testing.
 #
 # Environment:
 #   RETINA_SECRET        agent secret (required)
