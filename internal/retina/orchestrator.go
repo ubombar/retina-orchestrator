@@ -36,6 +36,9 @@ type Config struct {
 
 // Validate reports whether the configuration is usable.
 func (c *Config) Validate() error {
+	if err := c.Agent.validate(); err != nil {
+		return fmt.Errorf("agent: %w", err)
+	}
 	if err := c.Scheduler.validate(); err != nil {
 		return fmt.Errorf("scheduler: %w", err)
 	}
@@ -172,8 +175,15 @@ func (o *Orchestrator) serveAgent(ctx context.Context, conn *AgentConn) {
 	}
 	logger.Info("Agent connected")
 
-	// The sender issues this agent's PDs and sends them. A slow agent only
-	// delays its own schedule.
+	stopFlusher := make(chan struct{})
+	flusherDone := make(chan struct{})
+	go func() {
+		defer close(flusherDone)
+		o.flushAgent(ctx, conn, logger, stopFlusher)
+	}()
+
+	// The sender issues this agent's PDs and buffers them for the flusher. A
+	// slow agent only delays its own schedule.
 	senderDone := make(chan struct{})
 	go func() {
 		defer close(senderDone)
@@ -212,8 +222,32 @@ func (o *Orchestrator) serveAgent(ctx context.Context, conn *AgentConn) {
 
 	_ = conn.Close()
 	_ = issuer.Close()
+	close(stopFlusher)
 	<-senderDone
+	<-flusherDone
 	logger.Info("Agent disconnected")
+}
+
+// flushAgent sends the PDs buffered by the sender every flush period, so that
+// PDs are written to the agent in groups, not one by one. It returns when stop
+// is closed or the connection fails.
+func (o *Orchestrator) flushAgent(ctx context.Context, conn *AgentConn, logger *slog.Logger, stop <-chan struct{}) {
+	ticker := time.NewTicker(o.config.Agent.FlushPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := conn.Flush(); err != nil {
+				if ctx.Err() == nil {
+					logger.Warn("Cannot send PDs to agent", slog.Any("err", err))
+				}
+				_ = conn.Close()
+				return
+			}
+		case <-stop:
+			return
+		}
+	}
 }
 
 // runCapturer writes the received FIEs to the capturer until ctx is done, then

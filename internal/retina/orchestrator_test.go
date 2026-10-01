@@ -32,6 +32,8 @@ func TestOrchestrator_AcceptsAgentAndShutsDown(t *testing.T) {
 			Address:          addr,
 			Secret:           "s3cret",
 			HandshakeTimeout: time.Second,
+			WriteBufferSize:  4096,
+			FlushPeriod:      10 * time.Millisecond,
 		},
 		API:       APIConfig{Address: "127.0.0.1:0"},
 		Scheduler: SchedulerConfig{StartingPeriod: time.Second, EventQueueSize: 16},

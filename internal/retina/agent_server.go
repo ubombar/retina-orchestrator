@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
@@ -33,6 +34,23 @@ type AgentConfig struct {
 	KeepAliveIdle     time.Duration `json:"keep_alive_idle"`
 	KeepAliveInterval time.Duration `json:"keep_alive_interval"`
 	KeepAliveCount    int           `json:"keep_alive_count"`
+	// WriteBufferSize is the size in bytes of the buffer PDs are written to
+	// before they are sent to the agent.
+	WriteBufferSize int `json:"write_buffer_size"`
+	// FlushPeriod is how often buffered PDs are sent to the agent. A PD
+	// reaches the agent at most this long after SendPD, sooner when the buffer
+	// fills up.
+	FlushPeriod time.Duration `json:"flush_period"`
+}
+
+func (c *AgentConfig) validate() error {
+	if c.WriteBufferSize < 1 {
+		return fmt.Errorf("write buffer size must be at least 1: got %d", c.WriteBufferSize)
+	}
+	if c.FlushPeriod <= 0 {
+		return fmt.Errorf("flush period must be positive: got %v", c.FlushPeriod)
+	}
+	return nil
 }
 
 // AgentListener accepts agent connections.
@@ -72,7 +90,7 @@ func (l *AgentListener) Accept() (*AgentConn, error) {
 		config: l.config,
 		conn:   conn,
 		reader: bufio.NewReader(conn),
-		writer: bufio.NewWriter(conn),
+		writer: bufio.NewWriterSize(conn, l.config.WriteBufferSize),
 	}, nil
 }
 
@@ -84,12 +102,14 @@ func (l *AgentListener) Close() error {
 // AgentConn is a connection to one agent. The handshake is one JSON line each
 // way; after it, PDs and FIEs are exchanged as CSV lines.
 //
-// SendPD may be called from one goroutine and ReceiveFIE from another. Close
-// is safe to call from any goroutine and unblocks both.
+// SendPD may be called from one goroutine and ReceiveFIE from another. Flush
+// and Close are safe to call from any goroutine, and Close unblocks the others.
 type AgentConn struct {
-	config  *AgentConfig
-	conn    net.Conn
-	reader  *bufio.Reader
+	config *AgentConfig
+	conn   net.Conn
+	reader *bufio.Reader
+	// writeMu guards writer, which SendPD and Flush share.
+	writeMu sync.Mutex
 	writer  *bufio.Writer
 	agentID string
 }
@@ -135,20 +155,30 @@ func (c *AgentConn) Handshake() (string, error) {
 	return c.agentID, nil
 }
 
-// SendPD sends one PD to the agent, as the CSV line
+// SendPD writes one PD for the agent, as the CSV line
 // id,destination,near_ttl,protocol,first_half_word,second_half_word.
-// It has no deadline: it waits for as long as the agent applies backpressure,
-// and returns when the connection fails or is closed.
+// The PD is buffered: it is sent when the buffer fills up or on the next
+// Flush. SendPD has no deadline: once the buffer is full it waits for as long
+// as the agent applies backpressure, and returns when the connection fails or
+// is closed.
 func (c *AgentConn) SendPD(pd *PD) error {
 	if !pd.Destination.IsValid() {
 		return fmt.Errorf("cannot send PD %d: destination is not set", pd.ID)
 	}
-	_, err := fmt.Fprintf(c.writer, "%d,%q,%d,%d,%d,%d\n", pd.ID, pd.Destination.String(), pd.NearTTL, pd.Protocol, pd.FirstHalfWord, pd.SecondHalfWord)
-	if err == nil {
-		err = c.writer.Flush()
-	}
-	if err != nil {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if _, err := fmt.Fprintf(c.writer, "%d,%q,%d,%d,%d,%d\n", pd.ID, pd.Destination.String(), pd.NearTTL, pd.Protocol, pd.FirstHalfWord, pd.SecondHalfWord); err != nil {
 		return fmt.Errorf("cannot send PD: %w", err)
+	}
+	return nil
+}
+
+// Flush sends the buffered PDs to the agent. Like SendPD it has no deadline.
+func (c *AgentConn) Flush() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := c.writer.Flush(); err != nil {
+		return fmt.Errorf("cannot flush PDs: %w", err)
 	}
 	return nil
 }

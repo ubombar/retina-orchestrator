@@ -33,6 +33,8 @@ func run() error {
 	flag.DurationVar(&config.Agent.HandshakeTimeout, "agent-handshake-timeout", 5*time.Second, "Time an agent has to complete the handshake (0 for no limit)")
 	flag.DurationVar(&config.Agent.KeepAliveIdle, "agent-keepalive-idle", 30*time.Second, "Idle time before TCP keepalive probes are sent on an agent connection")
 	flag.DurationVar(&config.Agent.KeepAliveInterval, "agent-keepalive-interval", 10*time.Second, "Time between TCP keepalive probes on an agent connection")
+	flag.IntVar(&config.Agent.WriteBufferSize, "agent-write-buffer-size", 64*1024, "Size in bytes of the per-agent buffer PDs are written to before being sent")
+	flag.DurationVar(&config.Agent.FlushPeriod, "agent-flush-period", 100*time.Millisecond, "Interval at which buffered PDs are sent to an agent; a PD is delayed by at most this long")
 	flag.IntVar(&config.Agent.KeepAliveCount, "agent-keepalive-count", 3, "Unanswered TCP keepalive probes before an agent connection is closed")
 
 	flag.StringVar(&config.API.Address, "api-addr", "localhost:8080", "Listening address for the HTTP API")

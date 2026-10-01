@@ -19,6 +19,8 @@ func dialAgent(t *testing.T) (agent net.Conn, conn *AgentConn) {
 		Address:          "127.0.0.1:0",
 		Secret:           "s3cret",
 		HandshakeTimeout: time.Second,
+		WriteBufferSize:  4096,
+		FlushPeriod:      time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -76,6 +78,10 @@ func TestAgentConn_HandshakeSendReceive(t *testing.T) {
 		SecondHalfWord: 33434,
 	}
 	if err := conn.SendPD(pd); err != nil {
+		t.Fatal(err)
+	}
+	// The PD is only buffered until Flush.
+	if err := conn.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	want := `7,"198.51.100.9",4,17,24000,33434` + "\n"

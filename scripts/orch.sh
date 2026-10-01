@@ -40,6 +40,8 @@ exec ./retina-orchestrator \
 	--agent-keepalive-idle=30s \
 	--agent-keepalive-interval=10s \
 	--agent-keepalive-count=3 \
+	--agent-write-buffer-size=65536 \
+	--agent-flush-period=100ms \
 	--api-addr=":8080" \
 	--api-read-header-timeout=5s \
 	--scheduler-starting-period="${STARTING_PERIOD}" \
