@@ -473,10 +473,6 @@ type compactedFIE struct {
 
 //nolint:funlen,gocyclo
 func compactFIE(fie *api.ForwardingInfoElement, captureTime time.Time, rotationInterval time.Duration) (compactedFIE, error) {
-	if fie.ProbingDirectiveID > math.MaxUint32 {
-		return compactedFIE{}, fmt.Errorf("probing directive ID %d exceeds uint32", fie.ProbingDirectiveID)
-	}
-
 	captureTime = captureTime.UTC()
 	intervalBegin := captureTime.Truncate(rotationInterval)
 
@@ -516,7 +512,7 @@ func compactFIE(fie *api.ForwardingInfoElement, captureTime time.Time, rotationI
 		uint32(farRecvDelta)<<24
 
 	return compactedFIE{
-		pdID:          uint32(fie.ProbingDirectiveID),
+		pdID:          fie.ProbingDirectiveID,
 		nearReply:     nearReply,
 		farReply:      farReply,
 		captureSecond: uint16(captureSeconds),

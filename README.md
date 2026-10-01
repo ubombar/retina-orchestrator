@@ -104,7 +104,6 @@ See [DOCS.md](DOCS.md) for how it works inside, and for measured throughput.
 
 - `scripts/orch.sh` starts the orchestrator with the research settings and captures into a new directory under `./captures/` on each start.
 - `scripts/bulk_push.sh` and `scripts/insert_pds.sh` load a PD JSONL file through the HTTP API.
-- `scripts/memlog.sh` logs the process memory of a running orchestrator.
 
 For end-to-end tests without network probes, run the real agent with `--prober-type=mock`.
 

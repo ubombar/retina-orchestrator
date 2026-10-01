@@ -138,5 +138,5 @@ Compared with the previous implementation: no FIE stream or event stream over HT
 | `internal/retina/api_server.go` | PD insert endpoint |
 | `internal/retina/capturer.go` | DuckDB capture |
 | `internal/retina/types.go` | compact `PD` and `FIE` |
-| `scripts/` | run script, bulk loaders, memory logger |
+| `scripts/` | run script, bulk loaders |
 | `test/` | sample PD JSONL files |
