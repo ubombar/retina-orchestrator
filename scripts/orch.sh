@@ -51,5 +51,5 @@ exec ./retina-orchestrator \
 	--capturer-allow-non-empty-capture-dir=false \
 	--capturer-rotation-interval=1h \
 	--capturer-batch-size=100000 \
-	--capturer-queue-size=10000 \
+	--capturer-queue-size=200000 \
 	--capturer-flush-period=1s
