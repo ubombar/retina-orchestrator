@@ -7,16 +7,30 @@ package structures
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 )
 
-// All methods on consumer must be called from the same goroutine.
+var (
+	// ErrConsumerNotRegistered is returned when no consumer has the given id.
+	ErrConsumerNotRegistered = errors.New("consumer not registered")
+	// ErrConsumerBufferFull is returned by TryPush when the consumer's buffer
+	// has no room.
+	ErrConsumerBufferFull = errors.New("consumer buffer full")
+	// ErrConsumerClosed is returned when the consumer is closed while an
+	// operation is waiting on it.
+	ErrConsumerClosed = errors.New("consumer closed")
+)
+
+// Pop and Discard must be called from the same goroutine. Close is safe to
+// call from any goroutine.
 type consumer[T any] struct {
-	id    string
-	ch    chan *T
-	done  chan struct{}
-	queue *Queue[T]
+	id        string
+	ch        chan *T
+	done      chan struct{}
+	queue     *Queue[T]
+	closeOnce sync.Once
 }
 
 // Pop returns the next element, blocking until one is available, the context
@@ -33,25 +47,38 @@ func (qc *consumer[T]) Pop(ctx context.Context) (*T, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-qc.done:
-		return nil, fmt.Errorf("consumer closed")
+		return nil, ErrConsumerClosed
 	case item := <-qc.ch:
 		return item, nil
 	}
 }
 
-// Calling Close multiple times is a no-op.
+// Close unregisters the consumer and unblocks any Push waiting on it. Calling
+// Close multiple times, from any goroutine, is a no-op.
 func (qc *consumer[T]) Close() {
-	if qc.queue == nil {
-		return
-	}
+	qc.closeOnce.Do(func() {
+		qc.queue.mu.Lock()
+		defer qc.queue.mu.Unlock()
 
-	qc.queue.mu.Lock()
-	defer qc.queue.mu.Unlock()
-
-	if _, ok := qc.queue.consumers[qc.id]; ok {
-		delete(qc.queue.consumers, qc.id)
+		if c, ok := qc.queue.consumers[qc.id]; ok && c == qc {
+			delete(qc.queue.consumers, qc.id)
+		}
 		close(qc.done)
-		qc.queue = nil
+	})
+}
+
+// Discard removes everything still buffered and returns how many elements
+// were removed. It is meant to be called after Close, to account for elements
+// that were pushed but never popped.
+func (qc *consumer[T]) Discard() int {
+	n := 0
+	for {
+		select {
+		case <-qc.ch:
+			n++
+		default:
+			return n
+		}
 	}
 }
 
@@ -96,18 +123,51 @@ func (q *Queue[T]) NewConsumer(id string) (*consumer[T], error) {
 }
 
 // TryPush attempts to send an element to a specific consumer without blocking.
-// Returns an error if the consumer is not registered or the buffer is full.
+// Returns ErrConsumerNotRegistered if the consumer is not registered and
+// ErrConsumerBufferFull if its buffer is full.
 func (q *Queue[T]) TryPush(id string, item *T) error {
+	// The send happens under the mutex so that it cannot interleave with
+	// Close: an element is never accepted for a consumer that is already gone.
 	q.mu.Lock()
+	defer q.mu.Unlock()
+
 	consumer, ok := q.consumers[id]
-	q.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("consumer not registered")
+		return ErrConsumerNotRegistered
 	}
 	select {
 	case consumer.ch <- item:
 		return nil
 	default:
-		return fmt.Errorf("consumer buffer full")
+		return ErrConsumerBufferFull
+	}
+}
+
+// Push sends an element to a specific consumer, waiting for room if its buffer
+// is full. It returns ErrConsumerNotRegistered immediately if the consumer is
+// not registered, ErrConsumerClosed if the consumer is closed while waiting,
+// and the context error if ctx ends first.
+func (q *Queue[T]) Push(ctx context.Context, id string, item *T) error {
+	q.mu.Lock()
+	consumer, ok := q.consumers[id]
+	if !ok {
+		q.mu.Unlock()
+		return ErrConsumerNotRegistered
+	}
+	select {
+	case consumer.ch <- item:
+		q.mu.Unlock()
+		return nil
+	default:
+	}
+	q.mu.Unlock()
+
+	select {
+	case consumer.ch <- item:
+		return nil
+	case <-consumer.done:
+		return ErrConsumerClosed
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

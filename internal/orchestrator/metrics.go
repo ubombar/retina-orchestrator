@@ -18,6 +18,8 @@ type Metrics struct {
 	PDsSentTotal             *prometheus.CounterVec
 	FIEsReceivedTotal        *prometheus.CounterVec
 	AgentQueueSize           *prometheus.GaugeVec
+	PDsDroppedTotal          *prometheus.CounterVec
+	DispatchBlockedSeconds   *prometheus.CounterVec
 
 	// PD cycling
 	PDsTotal             prometheus.Gauge
@@ -70,6 +72,14 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 		AgentQueueSize: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "retina_orchestrator_agent_queue_size",
 			Help: "Current number of probing directives queued for the agent.",
+		}, []string{"agent_id"}),
+		PDsDroppedTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "retina_orchestrator_pds_dropped_total",
+			Help: "Total number of issued probing directives that never reached the agent, labeled by agent ID and reason (not_connected, disconnected, timeout).",
+		}, []string{"agent_id", "reason"}),
+		DispatchBlockedSeconds: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "retina_orchestrator_dispatch_blocked_seconds_total",
+			Help: "Total time the scheduler spent waiting for room in an agent's queue, labeled by agent ID.",
 		}, []string{"agent_id"}),
 
 		// PD cycling

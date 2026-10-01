@@ -30,6 +30,11 @@ type Config struct {
 	// Increase this value if agents are slow to consume directives.
 	PDQueueSize int `json:"pd_queue_size"`
 
+	// PDPushTimeout is how long the scheduler waits for room in a connected
+	// agent's queue before dropping the PD. Zero waits until there is room or
+	// the agent disconnects.
+	PDPushTimeout time.Duration `json:"pd_push_timeout"`
+
 	RingBufferSize int `json:"ring_buffer_size"`
 
 	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
@@ -81,6 +86,9 @@ func (c *Config) Validate() error {
 	if c.PDQueueSize <= 0 {
 		return fmt.Errorf("PDQueueSize must be greater than zero: got %d", c.PDQueueSize)
 	}
+	if c.PDPushTimeout < 0 {
+		return fmt.Errorf("PDPushTimeout cannot be negative: got %s", c.PDPushTimeout)
+	}
 	if c.RingBufferSize <= 0 {
 		return fmt.Errorf("RingBufferSize must be greater than zero: got %d", c.RingBufferSize)
 	}
@@ -98,6 +106,16 @@ func (c *Config) Validate() error {
 	}
 	return nil
 }
+
+// Reasons reported in PDsDroppedTotal.
+const (
+	pdDropNotConnected = "not_connected"
+	pdDropDisconnected = "disconnected"
+	pdDropTimeout      = "timeout"
+)
+
+// pdDropWarnInterval is the minimum time between two "PDs dropped" warnings.
+const pdDropWarnInterval = 10 * time.Second
 
 type Orchestrator struct {
 	config        *Config
@@ -286,6 +304,11 @@ func (o *Orchestrator) runCapturer(ctx context.Context) error {
 }
 
 func (o *Orchestrator) runScheduler(ctx context.Context) error {
+	var (
+		droppedSinceWarn int
+		lastDropWarn     time.Time
+	)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -301,13 +324,65 @@ func (o *Orchestrator) runScheduler(ctx context.Context) error {
 			continue
 		}
 
-		if err := o.pdQueue.TryPush(pd.AgentID, pd); err != nil {
-			o.logger.Debug("PD dropped: no queue for agent",
-				slog.String("agent_id", pd.AgentID),
-				slog.Uint64("pd_id", pd.ProbingDirectiveID))
-		} else {
-			o.metrics.AgentQueueSize.WithLabelValues(pd.AgentID).Inc()
+		reason, err := o.dispatch(ctx, pd)
+		if err != nil {
+			return err
 		}
+		if reason == "" {
+			o.metrics.AgentQueueSize.WithLabelValues(pd.AgentID).Inc()
+			continue
+		}
+
+		o.metrics.PDsDroppedTotal.WithLabelValues(pd.AgentID, reason).Inc()
+		o.logger.Debug("PD dropped",
+			slog.String("agent_id", pd.AgentID),
+			slog.Uint64("pd_id", pd.ProbingDirectiveID),
+			slog.String("reason", reason))
+
+		// The scheduler has already counted this PD as issued, so make the
+		// loss visible at the default log level without logging per PD.
+		droppedSinceWarn++
+		if time.Since(lastDropWarn) >= pdDropWarnInterval {
+			o.logger.Warn("PDs dropped at dispatch",
+				slog.Int("count", droppedSinceWarn),
+				slog.String("last_agent_id", pd.AgentID),
+				slog.String("last_reason", reason))
+			droppedSinceWarn = 0
+			lastDropWarn = time.Now()
+		}
+	}
+}
+
+// dispatch hands an issued PD to its agent's queue. If the queue is full it
+// waits for room, for at most PDPushTimeout, and stops waiting as soon as the
+// agent disconnects. It returns the drop reason, or "" if the PD was queued.
+// An error is returned only when ctx ends.
+func (o *Orchestrator) dispatch(ctx context.Context, pd *api.ProbingDirective) (string, error) {
+	err := o.pdQueue.TryPush(pd.AgentID, pd)
+	if errors.Is(err, structures.ErrConsumerBufferFull) {
+		pushCtx := ctx
+		if o.config.PDPushTimeout > 0 {
+			var cancel context.CancelFunc
+			pushCtx, cancel = context.WithTimeout(ctx, o.config.PDPushTimeout)
+			defer cancel()
+		}
+
+		start := time.Now()
+		err = o.pdQueue.Push(pushCtx, pd.AgentID, pd)
+		o.metrics.DispatchBlockedSeconds.WithLabelValues(pd.AgentID).Add(time.Since(start).Seconds())
+	}
+
+	switch {
+	case err == nil:
+		return "", nil
+	case errors.Is(err, structures.ErrConsumerNotRegistered):
+		return pdDropNotConnected, nil
+	case errors.Is(err, structures.ErrConsumerClosed):
+		return pdDropDisconnected, nil
+	case ctx.Err() != nil:
+		return "", ctx.Err()
+	default: // the push timeout expired
+		return pdDropTimeout, nil
 	}
 }
 
@@ -451,6 +526,12 @@ func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 	})
 
 	defer func() {
+		// PDs still buffered were issued by the scheduler but never sent.
+		consumer.Close()
+		if n := consumer.Discard(); n > 0 {
+			o.metrics.PDsDroppedTotal.WithLabelValues(status.agentID, pdDropDisconnected).Add(float64(n))
+		}
+
 		o.logger.Info("Agent disconnected", "agent_id", status.agentID)
 		o.metrics.AgentQueueSize.DeleteLabelValues(status.agentID)
 		o.ebus.Emit(&AgentDisconnectedEvent{
@@ -463,7 +544,7 @@ func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 
 	group.Go(func() error {
 		for {
-			fie, err := s.receiveFIE()
+			fie, err := s.receiveFIE(status.agentID)
 			if err != nil {
 				return err
 			}
@@ -518,6 +599,10 @@ func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 
 	group.Go(func() error {
 		<-ctx.Done()
+		// Release the queue before anything else: the scheduler may be waiting
+		// for room in it, and the receiver above may in turn be waiting for the
+		// scheduler in Update, so this must not wait for the group to finish.
+		consumer.Close()
 		_ = s.conn.Close()
 		return nil
 	})

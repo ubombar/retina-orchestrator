@@ -4,8 +4,9 @@
 package orchestrator
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -23,6 +24,21 @@ import (
 type blockingScheduler struct {
 	updating chan struct{}
 	release  chan struct{}
+}
+
+type blockingFailWriter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (w *blockingFailWriter) Write([]byte) (int, error) {
+	select {
+	case <-w.started:
+	default:
+		close(w.started)
+	}
+	<-w.release
+	return 0, errors.New("connection failed")
 }
 
 func (s *blockingScheduler) Insert(*api.ProbingDirective) (uint64, error) { return 0, nil }
@@ -176,6 +192,8 @@ func TestAgentHandler_FailedConnectionUnblocksDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newAgentStream: %v", err)
 	}
+	blockedWrite := &blockingFailWriter{started: make(chan struct{}), release: make(chan struct{})}
+	stream.writer = bufio.NewWriter(blockedWrite)
 
 	handlerDone := make(chan struct{})
 	go func() {
@@ -184,7 +202,7 @@ func TestAgentHandler_FailedConnectionUnblocksDispatch(t *testing.T) {
 	}()
 
 	// One FIE parks the receiver goroutine inside scheduler.Update.
-	if err := json.NewEncoder(agentConn).Encode(&api.ForwardingInfoElement{}); err != nil {
+	if _, err := agentConn.Write([]byte("0,1790868969,\"\",0,\"\",0\n")); err != nil {
 		t.Fatalf("send FIE: %v", err)
 	}
 	select {
@@ -193,20 +211,24 @@ func TestAgentHandler_FailedConnectionUnblocksDispatch(t *testing.T) {
 		t.Fatal("receiver never reached scheduler.Update")
 	}
 
-	// The agent never reads, so PDs pile up in the socket buffers until the
-	// sender blocks in write and the queue stays full.
-	pd := &api.ProbingDirective{AgentID: "a"}
-	deadline := time.Now().Add(4 * time.Second)
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-		err := o.pdQueue.Push(ctx, "a", pd)
-		cancel()
-		if err != nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("queue never filled up")
-		}
+	// Block the first PD write, then leave a second PD in the one-element queue.
+	pd := &api.ProbingDirective{
+		AgentID:            "a",
+		DestinationAddress: net.ParseIP("1.1.1.1"),
+		NearTTL:            1,
+		Protocol:           api.ICMP,
+		NextHeader:         api.NextHeader{ICMPNextHeader: &api.ICMPNextHeader{}},
+	}
+	if err := o.pdQueue.Push(context.Background(), "a", pd); err != nil {
+		t.Fatalf("push first PD: %v", err)
+	}
+	select {
+	case <-blockedWrite.started:
+	case <-time.After(time.Second):
+		t.Fatal("sender did not start the blocked write")
+	}
+	if err := o.pdQueue.Push(context.Background(), "a", pd); err != nil {
+		t.Fatalf("push queued PD: %v", err)
 	}
 
 	dispatched := make(chan string, 1)
@@ -232,6 +254,7 @@ func TestAgentHandler_FailedConnectionUnblocksDispatch(t *testing.T) {
 		t.Fatal("dispatch still blocked after the connection failed")
 	}
 
+	close(blockedWrite.release)
 	close(sched.release)
 	select {
 	case <-handlerDone:

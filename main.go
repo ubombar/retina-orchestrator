@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -51,6 +52,7 @@ func run() error {
 		agentAddr            = flag.String("agent-addr", envOrDefault("RETINA_AGENT_ADDR", "localhost:50050"), "Listening address for agent connections")
 		agentBufferLength    = flag.Int("agent-buffer-length", envOrDefaultInt("RETINA_AGENT_BUFFER_LENGTH", 8192), "Buffer length for per-agent PD channels")
 		pdQueueSize          = flag.Int("pd-queue-size", envOrDefaultInt("RETINA_PD_QUEUE_SIZE", 100), "The size of the agent queue")
+		pdPushTimeout        = flag.Duration("pd-push-timeout", envOrDefaultDuration("RETINA_PD_PUSH_TIMEOUT", time.Second), "How long the scheduler waits for room in a connected agent's full queue before dropping the PD (0 waits until room or disconnect)")
 		ringBufferSize       = flag.Int("ring-buffer-size", envOrDefaultInt("RETINA_RING_BUFFER_SIZE", 100), "The size of the ring buffer")
 		eventBusSize         = flag.Int("event-bus-size", envOrDefaultInt("RETINA_EVENT_BUS_SIZE", 1024*1024), "Size of the event bus")
 		eventsDir            = flag.String("events-dir", envOrDefault("RETINA_EVENTS_DIR", ""), "Directory where orchestrator events are written as JSONL; empty disables event persistence")
@@ -131,6 +133,7 @@ func run() error {
 	orch, err := orchestrator.NewOrchestrator(&orchestrator.Config{
 		AgentAddress:            *agentAddr,
 		PDQueueSize:             *pdQueueSize,
+		PDPushTimeout:           *pdPushTimeout,
 		RingBufferSize:          *ringBufferSize,
 		AgentBufferLength:       *agentBufferLength,
 		APIAddress:              *apiAddr,
@@ -211,6 +214,14 @@ func startMetricsServer(logger *slog.Logger, registry *prometheus.Registry, addr
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+
+	// Runtime profiles, served next to the metrics on the same internal-only
+	// address: go tool pprof http://<metrics-addr>/debug/pprof/profile
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
 	//nolint:gosec // G112: metrics endpoint is internal-only; timeout omitted intentionally
 	srv := &http.Server{Handler: mux}

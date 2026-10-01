@@ -4,11 +4,14 @@
 package orchestrator
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,7 +55,8 @@ type agentServerConfig struct {
 	authHandler      authHandleFunc
 }
 
-// agentServer handles bidirectional PD/FIE communication with agents over newline-delimited JSON.
+// agentServer uses newline-delimited JSON for authentication, then compact CSV
+// records for bidirectional PD/FIE communication.
 type agentServer struct {
 	config   *agentServerConfig
 	logger   *slog.Logger
@@ -209,6 +213,9 @@ func (s *agentServer) handshake(stream *agentStream) (*agentAuthStatus, error) {
 	if err := send(stream.conn, stream.encoder, s.config.handshakeTimeout, &authResp); err != nil {
 		return nil, fmt.Errorf("could not send auth response: %w", err)
 	}
+	if err := stream.writer.Flush(); err != nil {
+		return nil, fmt.Errorf("could not flush auth response: %w", err)
+	}
 
 	if !authResp.Authenticated {
 		s.metrics.AuthFailuresTotal.Inc()
@@ -241,6 +248,8 @@ type agentStream struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	conn    *net.TCPConn
+	reader  *bufio.Reader
+	writer  *bufio.Writer
 	encoder *json.Encoder
 	decoder *json.Decoder
 	server  *agentServer
@@ -257,15 +266,32 @@ func newAgentStream(id int, conn *net.TCPConn, server *agentServer) (*agentStrea
 	}
 
 	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
 	return &agentStream{
 		id:      id,
 		conn:    conn,
 		ctx:     ctx,
 		cancel:  cancel,
-		encoder: json.NewEncoder(conn),
-		decoder: json.NewDecoder(conn),
+		reader:  reader,
+		writer:  writer,
+		encoder: json.NewEncoder(writer),
+		decoder: json.NewDecoder(singleByteReader{reader: reader}),
 		server:  server,
 	}, nil
+}
+
+// singleByteReader prevents the JSON handshake decoder from reading ahead into
+// the first CSV record, which belongs to the post-handshake protocol.
+type singleByteReader struct {
+	reader io.Reader
+}
+
+func (r singleByteReader) Read(p []byte) (int, error) {
+	if len(p) > 1 {
+		p = p[:1]
+	}
+	return r.reader.Read(p)
 }
 
 func (s *agentStream) context() context.Context {
@@ -273,11 +299,36 @@ func (s *agentStream) context() context.Context {
 }
 
 func (s *agentStream) sendPD(e *api.ProbingDirective) error {
-	return send(s.conn, s.encoder, agentSendTimeout, e)
+	if err := s.conn.SetWriteDeadline(time.Now().Add(agentSendTimeout)); err != nil {
+		return fmt.Errorf("send failed: cannot set write deadline: %w", err)
+	}
+	record, err := encodePDRecord(e)
+	if err != nil {
+		return fmt.Errorf("send failed: cannot encode PD: %w", err)
+	}
+	if _, err = s.writer.WriteString(record); err == nil {
+		err = s.writer.Flush()
+	}
+	if err != nil {
+		return fmt.Errorf("send failed: cannot write PD: %w", err)
+	}
+	return nil
 }
 
-func (s *agentStream) receiveFIE() (*api.ForwardingInfoElement, error) {
-	return receive[api.ForwardingInfoElement](s.conn, s.decoder, 0)
+func (s *agentStream) receiveFIE(agentID string) (*api.ForwardingInfoElement, error) {
+	var line string
+	for strings.TrimSpace(line) == "" {
+		var err error
+		line, err = s.reader.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("receive failed: cannot read FIE: %w", err)
+		}
+	}
+	fie, err := decodeFIERecord(line, agentID)
+	if err != nil {
+		return nil, fmt.Errorf("receive failed: cannot decode FIE: %w", err)
+	}
+	return fie, nil
 }
 
 func send[E any](conn *net.TCPConn, encoder *json.Encoder, timeout time.Duration, e *E) error {

@@ -3,6 +3,7 @@ package structures
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -547,4 +548,157 @@ func TestConcurrent_ManyConsumers(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// --- Push ---
+
+func TestPush_NotRegistered(t *testing.T) {
+	t.Parallel()
+	q, _ := NewQueue[int](1)
+	v := 1
+	if err := q.Push(context.Background(), "missing", &v); !errors.Is(err, ErrConsumerNotRegistered) {
+		t.Fatalf("expected ErrConsumerNotRegistered, got %v", err)
+	}
+}
+
+func TestPush_RoomAvailable(t *testing.T) {
+	t.Parallel()
+	q, _ := NewQueue[int](1)
+	cons, _ := q.NewConsumer("a")
+	defer cons.Close()
+
+	v := 7
+	if err := q.Push(context.Background(), "a", &v); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got, err := cons.Pop(context.Background())
+	if err != nil || *got != 7 {
+		t.Fatalf("expected 7, got %v (err %v)", got, err)
+	}
+}
+
+func TestPush_BlocksUntilPop(t *testing.T) {
+	t.Parallel()
+	q, _ := NewQueue[int](1)
+	cons, _ := q.NewConsumer("a")
+	defer cons.Close()
+
+	first, second := 1, 2
+	if err := q.TryPush("a", &first); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := q.TryPush("a", &second); !errors.Is(err, ErrConsumerBufferFull) {
+		t.Fatalf("expected ErrConsumerBufferFull, got %v", err)
+	}
+
+	pushed := make(chan error, 1)
+	go func() { pushed <- q.Push(context.Background(), "a", &second) }()
+
+	select {
+	case err := <-pushed:
+		t.Fatalf("Push returned on a full buffer: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if got, _ := cons.Pop(context.Background()); *got != 1 {
+		t.Fatalf("expected 1, got %d", *got)
+	}
+	select {
+	case err := <-pushed:
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Push did not return after room was made")
+	}
+	if got, _ := cons.Pop(context.Background()); *got != 2 {
+		t.Fatalf("expected 2, got %d", *got)
+	}
+}
+
+func TestPush_UnblocksOnClose(t *testing.T) {
+	t.Parallel()
+	q, _ := NewQueue[int](1)
+	cons, _ := q.NewConsumer("a")
+
+	v := 1
+	_ = q.TryPush("a", &v)
+
+	pushed := make(chan error, 1)
+	go func() { pushed <- q.Push(context.Background(), "a", &v) }()
+	time.Sleep(20 * time.Millisecond)
+
+	// Close from a goroutine other than the one that owns the consumer.
+	go cons.Close()
+
+	select {
+	case err := <-pushed:
+		if !errors.Is(err, ErrConsumerClosed) {
+			t.Fatalf("expected ErrConsumerClosed, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Push did not return after Close")
+	}
+	if err := q.Push(context.Background(), "a", &v); !errors.Is(err, ErrConsumerNotRegistered) {
+		t.Fatalf("expected ErrConsumerNotRegistered after Close, got %v", err)
+	}
+}
+
+func TestPush_ContextTimeout(t *testing.T) {
+	t.Parallel()
+	q, _ := NewQueue[int](1)
+	cons, _ := q.NewConsumer("a")
+	defer cons.Close()
+
+	v := 1
+	_ = q.TryPush("a", &v)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if err := q.Push(ctx, "a", &v); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+	}
+}
+
+func TestConsumer_ConcurrentClose(t *testing.T) {
+	t.Parallel()
+	q, _ := NewQueue[int](1)
+	cons, _ := q.NewConsumer("a")
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(cons.Close)
+	}
+	wg.Wait()
+
+	// The id is free again and the old consumer's Close must not remove the
+	// new registration.
+	replacement, err := q.NewConsumer("a")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer replacement.Close()
+	cons.Close()
+	v := 1
+	if err := q.TryPush("a", &v); err != nil {
+		t.Fatalf("replacement consumer was unregistered: %v", err)
+	}
+}
+
+func TestConsumer_Discard(t *testing.T) {
+	t.Parallel()
+	q, _ := NewQueue[int](4)
+	cons, _ := q.NewConsumer("a")
+
+	v := 1
+	for range 3 {
+		_ = q.TryPush("a", &v)
+	}
+	cons.Close()
+	if n := cons.Discard(); n != 3 {
+		t.Fatalf("expected 3 discarded, got %d", n)
+	}
+	if n := cons.Discard(); n != 0 {
+		t.Fatalf("expected 0 discarded, got %d", n)
+	}
 }
