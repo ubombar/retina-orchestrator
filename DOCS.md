@@ -15,7 +15,7 @@ Internal documentation of the code on the research branch. `main.go` and `--help
                   │      ▼                            │
                   │  per-agent sender ─ buffer ─ flush│
                   │                                   │
-                  │  per-agent receiver ─► FIE queue ─┼──► DuckDB capture files
+                  │  per-agent receiver ─► FIE queue ─┼──► fies2a capture files
                   └──────┼─────────────────▲──────────┘
                     PD (CSV line)     FIE (CSV line)
                          ▼                 │
@@ -31,7 +31,7 @@ All code is in `internal/retina`. The components expose plain functions and meth
 
 ## 2. Types — `types.go`
 
-The orchestrator uses its own compact `PD` and `FIE` structs, which mirror the CSV records field for field. The larger `ProbingDirective` and `ForwardingInfoElement` from `retina-commons` appear only at the edges: the HTTP API converts incoming PDs with `compactPD`, and `expandFIE` rebuilds a full FIE for the capturer. PD IDs are `uint32`, addresses are `netip.Addr`.
+The orchestrator uses its own compact `PD` and `FIE` structs, which mirror the CSV records field for field. The larger `ProbingDirective` and `ForwardingInfoElement` from `retina-commons` appear only at the edges: the HTTP API converts incoming PDs with `compactPD`. The capturer takes the compact `FIE` as it is. PD IDs are `uint32`, addresses are `netip.Addr`.
 
 ## 3. Process layout — `orchestrator.go`
 
@@ -42,7 +42,7 @@ The orchestrator uses its own compact `PD` and `FIE` structs, which mirror the C
 | closer | When the context ends, closes the agent listener and the HTTP server |
 | API server | Serves `POST /api/v1/pds` |
 | scheduler | `Scheduler.Run`, the only goroutine that touches the schedule |
-| capturer | `runCapturer`, drains the FIE queue into DuckDB |
+| capturer | `runCapturer`, drains the FIE queue into the capturer |
 | accept loop | Accepts agent connections and starts `serveAgent` for each |
 
 An error from the API server, the capturer or the accept loop stops the orchestrator. A failing agent connection never does.
@@ -86,12 +86,17 @@ The scheduler is event-based. `Scheduler.Run` owns all state and applies events 
 
 ## 7. Capture — `capturer.go`
 
-`runCapturer` drains the FIE queue (`--capturer-queue-size`) into `DDBFIECapturer` and calls `Flush` every `--capturer-flush-period`. At shutdown it writes what is still queued, then flushes and closes the file.
+`runCapturer` drains the FIE queue (`--capturer-queue-size`) into the `Capturer` and calls `Flush` every `--capturer-flush-period`. At shutdown it writes what is still queued, then closes the capturer.
 
-The capturer writes one compact row per FIE into `fies-<intervalStartUTC>.duckdb`, one file per `--capturer-rotation-interval`: PD ID (`uint32`), near and far reply address blobs, the capture second within the interval (`uint16`), and five 6-bit second deltas packed into a `uint32`. The format is described at the top of `capturer.go`. That file is kept as it was before the rewrite and must not be changed casually.
+The capturer writes the fies2a format, described with its assumptions and limits in [FIES2.md](FIES2.md): one zstd Parquet file per `--capturer-rotation-interval`, `fies2a-<intervalStartUTC>.parquet`, sorted by `(pd_id, capture_second)`. A file can only be sorted once its interval is over, so there are two stages:
 
-- Startup fails if the capture directory is not empty, unless `--capturer-allow-non-empty-capture-dir` is set.
-- DuckDB's memory grows over the life of a file, which is why the rotation interval defaults to one hour.
+1. **Staging.** FIEs are appended in arrival order to `fies2a-<intervalStartUTC>.staging.duckdb` with DuckDB's appender, under `--capturer-staging-memory-limit`.
+2. **Finalizing.** At rotation the staging file is closed and a background goroutine sorts it into the Parquet file (`--capturer-finalize-memory-limit`, `--capturer-finalize-threads`; the sort spills next to the file beyond the limit), renames it from `.parquet.tmp` once complete, and deletes the staging file. Capturing continues into the next staging file meanwhile; one file is finalized at a time. At shutdown, `Close` finalizes the current interval and waits.
+
+- Startup fails if the capture directory is not empty, unless `--capturer-allow-non-empty-capture-dir` is set; staging files found there (left by a crash) are finalized before capturing starts.
+- A failed finalization is logged and its staging file kept; it does not stop the orchestrator. Successful ones log `Capture file finalized` with the size and duration.
+- During a sort the staging file, the spill files and the Parquet file coexist: at 200k FIEs/s and one-hour files, plan for about 15–20 GB free.
+- Measured in a container shaped like the research VM (2 CPUs, pd-balanced-like disk): about 1.8M FIEs/s appended (one core, the appender is single-threaded), and 1.86 bytes per FIE for a real hour of us-east1 FIEs against 13 for the previous format.
 
 ## 8. Backpressure
 
@@ -136,7 +141,7 @@ Compared with the previous implementation: no FIE stream or event stream over HT
 | `internal/retina/agent_server.go` | agent listener and connection, handshake, CSV encoding |
 | `internal/retina/scheduler.go` | scheduler, issuer, per-agent heap |
 | `internal/retina/api_server.go` | PD insert endpoint |
-| `internal/retina/capturer.go` | DuckDB capture |
+| `internal/retina/capturer.go` | fies2a capture: staging, sorting into Parquet |
 | `internal/retina/types.go` | compact `PD` and `FIE` |
 | `scripts/` | run script, bulk loaders |
 | `test/` | sample PD JSONL files |

@@ -1,6 +1,6 @@
 # Retina Orchestrator
 
-Retina Orchestrator accepts Probing Directives (PDs) over HTTP, schedules them, sends them to authenticated Retina agents, and captures the Forwarding Information Elements (FIEs) the agents send back into DuckDB files.
+Retina Orchestrator accepts Probing Directives (PDs) over HTTP, schedules them, sends them to authenticated Retina agents, and captures the Forwarding Information Elements (FIEs) the agents send back into hourly Parquet files in the fies2a format ([FIES2.md](FIES2.md)).
 
 This checkout is a research branch. Its code lives in `internal/retina` and its flags differ from released Retina versions.
 
@@ -51,12 +51,16 @@ RETINA_SECRET='replace-with-a-secret' ./retina-orchestrator \
 | `--scheduler-starting-period` | `10s` | Issuance period of every PD, and the delay before its first issuance |
 | `--scheduler-max-issuance-count` | `0` | Issuances per PD before it leaves the schedule; 0 is indefinitely |
 | `--scheduler-event-queue-size` | `1024` | Size of the scheduler event queue |
-| `--capturer-capture-dir` | `./capture` | Directory for the DuckDB capture files |
-| `--capturer-allow-non-empty-capture-dir` | `false` | Allow starting with files already in the capture directory |
+| `--capturer-capture-dir` | `./capture` | Directory for the staging and capture files |
+| `--capturer-allow-non-empty-capture-dir` | `false` | Allow starting with files already in the capture directory; staging files found there are finalized first |
 | `--capturer-rotation-interval` | `1h` | Time span covered by one capture file, at most 18h |
-| `--capturer-batch-size` | `100000` | FIEs appended before the capture file is flushed |
+| `--capturer-batch-size` | `100000` | FIEs appended before the staging file is flushed |
+| `--capturer-row-group-size` | `1048576` | Rows per Parquet row group |
+| `--capturer-staging-memory-limit` | `1GB` | DuckDB memory limit of the staging file |
+| `--capturer-finalize-memory-limit` | `2GB` | DuckDB memory limit while sorting a staging file into its capture file; beyond it the sort spills to disk |
+| `--capturer-finalize-threads` | `2` | DuckDB threads used for that sort |
 | `--capturer-queue-size` | `200000` | Received FIEs that may wait to be captured |
-| `--capturer-flush-period` | `1s` | Interval between periodic flushes of the capture file |
+| `--capturer-flush-period` | `1s` | Interval between periodic flushes of the staging file |
 
 ## Agent wire protocol
 
@@ -78,7 +82,7 @@ probing_directive_id,unix_capture_timestamp,"near_address",near_capture_delta,"f
 
 Addresses are always quoted. A missing near or far reply is `"",0`. A delta is the whole seconds between that reply and the capture timestamp. The record carries no sent timestamps.
 
-PD IDs are 32-bit. There is no protocol negotiation, so agent and orchestrator must be upgraded together. The matching agent is `retina-agent` on `research-v1.0.0`, and both use `retina-commons` on `research-v1.0.0`.
+PD IDs are 32-bit. There is no protocol negotiation, so agent and orchestrator must be upgraded together. The matching agent is `retina-agent` on `research-v1.1.0`, and both use `retina-commons` on `research-v1.0.0`.
 
 ## HTTP API
 
@@ -95,8 +99,8 @@ The response is `{"inserted_count":N,"first_id":X}`. The inserted PDs have conse
 - PDs of an agent that is not connected wait in the schedule and are issued when it connects.
 - A second connection with an agent ID that is already connected is closed after the handshake.
 - Every received FIE is captured. When the capture queue is full, the orchestrator stops reading from the agents, which slows them down.
-- A capturer error stops the orchestrator.
-- SIGINT and SIGTERM shut down cleanly: queued FIEs are written and the capture file is closed.
+- A capturer error stops the orchestrator. A failed sort into Parquet does not: it is logged, and its staging file is kept for a later run to finalize.
+- SIGINT and SIGTERM shut down cleanly: queued FIEs are written and the current interval is sorted into its capture file before the process exits.
 
 See [DOCS.md](DOCS.md) for how it works inside, and for measured throughput.
 
