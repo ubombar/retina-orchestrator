@@ -11,10 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/netip"
 	"time"
-
-	"github.com/dioptra-io/retina-commons/api/v1"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -25,8 +22,8 @@ type Config struct {
 	API       APIConfig       `json:"api"`
 	Scheduler SchedulerConfig `json:"scheduler"`
 
-	// Capturer configures the DuckDB files that received FIEs are written to.
-	Capturer DDBFIECapturerConfig `json:"capturer"`
+	// Capturer configures the fies2a files that received FIEs are written to.
+	Capturer CapturerConfig `json:"capturer"`
 	// CaptureQueueSize is how many received FIEs may wait to be captured.
 	// Agents are slowed down, not dropped, while the queue is full.
 	CaptureQueueSize int `json:"capture_queue_size"`
@@ -56,7 +53,7 @@ type Orchestrator struct {
 	config    *Config
 	logger    *slog.Logger
 	scheduler *Scheduler
-	capturer  FIECapturer
+	capturer  *Capturer
 	// fies carries the FIEs received from all agents to the capturer.
 	fies chan *FIE
 }
@@ -73,7 +70,7 @@ func NewOrchestrator(config *Config, logger *slog.Logger) (*Orchestrator, error)
 		logger = slog.Default()
 	}
 
-	capturer, err := NewDDBFIECapturer(&config.Capturer)
+	capturer, err := NewCapturer(&config.Capturer, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -288,29 +285,8 @@ func (o *Orchestrator) runCapturer(ctx context.Context) (err error) {
 
 // capture writes one FIE to the capturer.
 func (o *Orchestrator) capture(fie *FIE) error {
-	// Not the orchestrator's context: queued FIEs are still written at shutdown.
-	if err := o.capturer.Capture(context.Background(), expandFIE(fie)); err != nil {
+	if err := o.capturer.Capture(fie); err != nil {
 		return fmt.Errorf("cannot capture FIE: %w", err)
 	}
 	return nil
-}
-
-// expandFIE converts a FIE into the public API form the capturer takes. A FIE
-// carries no sent timestamps, so they are set to the received ones.
-func expandFIE(fie *FIE) *api.ForwardingInfoElement {
-	capture := time.Unix(fie.CaptureUnix, 0).UTC()
-	info := func(reply netip.Addr, delta uint32) *api.Info {
-		if !reply.IsValid() {
-			return nil
-		}
-		received := capture.Add(-time.Duration(delta) * time.Second)
-		return &api.Info{ReplyAddress: reply.AsSlice(), SentTimestamp: received, ReceivedTimestamp: received}
-	}
-	return &api.ForwardingInfoElement{
-		Agent:               api.Agent{AgentID: fie.AgentID},
-		ProbingDirectiveID:  fie.PDID,
-		NearInfo:            info(fie.Near, fie.NearDelta),
-		FarInfo:             info(fie.Far, fie.FarDelta),
-		ProductionTimestamp: capture,
-	}
 }

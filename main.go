@@ -44,12 +44,16 @@ func run() error {
 	flag.Uint64Var(&config.Scheduler.MaxIssuanceCount, "scheduler-max-issuance-count", 0, "Number of times each PD is issued before it leaves the schedule (0 for indefinitely)")
 	flag.IntVar(&config.Scheduler.EventQueueSize, "scheduler-event-queue-size", 1024, "Size of the scheduler event queue (at least 1)")
 
-	flag.StringVar(&config.Capturer.CaptureDir, "capturer-capture-dir", "./capture", "Directory where the DuckDB FIE capture files are written")
+	flag.StringVar(&config.Capturer.CaptureDir, "capturer-capture-dir", "./capture", "Directory where the fies2a capture files are written")
 	flag.BoolVar(&config.Capturer.AllowNonEmptyCaptureDir, "capturer-allow-non-empty-capture-dir", false, "Allow capturing into a directory that already has files")
 	flag.DurationVar(&config.Capturer.RotationInterval, "capturer-rotation-interval", time.Hour, "Time span covered by one capture file (at most 18h)")
-	flag.IntVar(&config.Capturer.BatchSize, "capturer-batch-size", 100_000, "Number of FIEs appended before the capture file is flushed")
+	flag.IntVar(&config.Capturer.BatchSize, "capturer-batch-size", 100_000, "Number of FIEs appended before the staging file is flushed")
+	flag.IntVar(&config.Capturer.RowGroupSize, "capturer-row-group-size", 1<<20, "Rows per Parquet row group in a capture file")
+	flag.StringVar(&config.Capturer.StagingMemoryLimit, "capturer-staging-memory-limit", "1GB", "DuckDB memory limit of the staging file the current interval is appended to")
+	flag.StringVar(&config.Capturer.FinalizeMemoryLimit, "capturer-finalize-memory-limit", "2GB", "DuckDB memory limit while sorting a staging file into its capture file; beyond it the sort spills to disk")
+	flag.IntVar(&config.Capturer.FinalizeThreads, "capturer-finalize-threads", 2, "DuckDB threads used while sorting a staging file into its capture file")
 	flag.IntVar(&config.CaptureQueueSize, "capturer-queue-size", 200_000, "Number of received FIEs that may wait to be captured")
-	flag.DurationVar(&config.CaptureFlushPeriod, "capturer-flush-period", time.Second, "Interval between periodic flushes of the capture file")
+	flag.DurationVar(&config.CaptureFlushPeriod, "capturer-flush-period", time.Second, "Interval between periodic flushes of the staging file")
 	flag.Parse()
 
 	// The secret is read from the environment only, so that it does not show

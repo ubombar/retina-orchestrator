@@ -13,6 +13,7 @@ import (
 	"net"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -35,13 +36,9 @@ func TestOrchestrator_AcceptsAgentAndShutsDown(t *testing.T) {
 			WriteBufferSize:  4096,
 			FlushPeriod:      10 * time.Millisecond,
 		},
-		API:       APIConfig{Address: "127.0.0.1:0"},
-		Scheduler: SchedulerConfig{StartingPeriod: time.Second, EventQueueSize: 16},
-		Capturer: DDBFIECapturerConfig{
-			BatchSize:        100,
-			CaptureDir:       captureDir,
-			RotationInterval: time.Hour,
-		},
+		API:                APIConfig{Address: "127.0.0.1:0"},
+		Scheduler:          SchedulerConfig{StartingPeriod: time.Second, EventQueueSize: 16},
+		Capturer:           *testCapturerConfig(captureDir),
 		CaptureQueueSize:   16,
 		CaptureFlushPeriod: time.Second,
 	}, nil)
@@ -129,16 +126,16 @@ func writeLine(t *testing.T, conn net.Conn, line string) {
 // capturedRows returns the PD id and reply addresses of every captured FIE.
 func capturedRows(t *testing.T, captureDir string) []string {
 	t.Helper()
-	files, err := filepath.Glob(filepath.Join(captureDir, "fies-*.duckdb"))
-	if err != nil || len(files) != 1 {
-		t.Fatalf("capture files: got %v, %v, want one file", files, err)
+	files, err := filepath.Glob(filepath.Join(captureDir, "*"))
+	if err != nil || len(files) != 1 || !strings.HasSuffix(files[0], ".parquet") {
+		t.Fatalf("capture files: got %v, %v, want one parquet file", files, err)
 	}
-	db, err := sql.Open("duckdb", files[0])
+	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	rows, err := db.Query("SELECT probing_directive_id, near_reply_address, far_reply_address FROM fies")
+	rows, err := db.Query("SELECT pd_id, near_reply_addr, far_reply_addr FROM read_parquet(?)", files[0])
 	if err != nil {
 		t.Fatal(err)
 	}

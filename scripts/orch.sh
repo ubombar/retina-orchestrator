@@ -51,5 +51,9 @@ exec ./retina-orchestrator \
 	--capturer-allow-non-empty-capture-dir=false \
 	--capturer-rotation-interval=1h \
 	--capturer-batch-size=100000 \
+	--capturer-row-group-size=1048576 \
+	--capturer-staging-memory-limit=1GB \
+	--capturer-finalize-memory-limit=2GB \
+	--capturer-finalize-threads=2 \
 	--capturer-queue-size=200000 \
 	--capturer-flush-period=1s
