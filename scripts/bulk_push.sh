@@ -82,6 +82,7 @@ for chunk in "${CHUNKS[@]}"; do
 	fi
 
 	rm -f "$chunk"
+	sleep "${SLEEP:-1}"
 done
 
 TOTAL_ELAPSED=$(($(date +%s) - START_TIME))
