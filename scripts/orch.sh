@@ -49,7 +49,7 @@ exec ./retina-orchestrator \
 	--scheduler-event-queue-size=1024 \
 	--capturer-capture-dir="${CAPTURE_DIR}/fies" \
 	--capturer-allow-non-empty-capture-dir=false \
-	--capturer-rotation-interval=1h \
+	--capturer-rotation-interval=15m \
 	--capturer-batch-size=100000 \
 	--capturer-row-group-size=1048576 \
 	--capturer-staging-memory-limit=1GB \
