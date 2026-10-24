@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -30,6 +31,12 @@ type SchedulerConfig struct {
 	// EventQueueSize is the size of the scheduler's event queue. Callers
 	// block while it is full.
 	EventQueueSize int `json:"event_queue_size"`
+	// PerAddressImpactThreshold is the responsible probing threshold Λ, in
+	// hits per second on any one address. The load of an address is the sum
+	// of 1/P over the near and far slots of the PDs predicted to hit it, and
+	// a PD whose busiest address has load M is next issued after
+	// P · max(1, M/Λ) instead of P. Zero disables responsible probing.
+	PerAddressImpactThreshold float64 `json:"per_address_impact_threshold"`
 }
 
 func (c *SchedulerConfig) validate() error {
@@ -38,6 +45,9 @@ func (c *SchedulerConfig) validate() error {
 	}
 	if c.EventQueueSize < 1 {
 		return fmt.Errorf("event queue size must be at least 1: got %d", c.EventQueueSize)
+	}
+	if t := c.PerAddressImpactThreshold; t < 0 || math.IsNaN(t) || math.IsInf(t, 0) {
+		return fmt.Errorf("per-address impact threshold must be finite and not negative: got %v", t)
 	}
 	return nil
 }
@@ -100,6 +110,28 @@ type Scheduler struct {
 	events  chan event
 	stopped chan struct{}
 	nodes   map[string]*agentNode
+	// pdStates is the responsible probing state of each PD, indexed by ID.
+	pdStates []pdState
+	// addrs holds the load of each predicted address. Index 0 is the
+	// unknown address and always has load 0. addrIndex maps an address to
+	// its index in addrs.
+	addrs     []addrLoad
+	addrIndex map[netip.Addr]uint32
+}
+
+// pdState is what responsible probing keeps per PD.
+type pdState struct {
+	// near and far index the predicted addresses in addrs, 0 if unknown.
+	near, far uint32
+	// period is the base period P of the PD, in nanoseconds.
+	period  int64
+	retired bool
+}
+
+// addrLoad is a predicted address and its load in hits per second.
+type addrLoad struct {
+	addr netip.Addr
+	load float64
 }
 
 // NewScheduler creates an empty scheduler from a valid configuration.
@@ -110,6 +142,9 @@ func NewScheduler(config *SchedulerConfig) *Scheduler {
 		events:  make(chan event, config.EventQueueSize),
 		stopped: make(chan struct{}),
 		nodes:   make(map[string]*agentNode),
+		// Index 0 is the unknown address.
+		addrs:     make([]addrLoad, 1),
+		addrIndex: make(map[netip.Addr]uint32),
 	}
 }
 
@@ -228,6 +263,7 @@ func (s *Scheduler) apply(ev *event) {
 		for i := range ev.pds {
 			node := s.node(ev.pds[i].AgentID)
 			pd := ev.pds[i]
+			s.addPDState(pd.ID)
 			pd.AgentID = node.agentID
 			node.pds = append(node.pds, pd)
 			node.heap.push(heapEntry{due: due, index: len(node.pds) - 1})
@@ -238,7 +274,7 @@ func (s *Scheduler) apply(ev *event) {
 		}
 
 	case eventUpdate:
-		// Nothing uses FIEs yet.
+		s.applyFIE(ev.fie)
 
 	case eventConnect:
 		node := s.node(ev.issuer.agentID)
@@ -291,10 +327,106 @@ func (s *Scheduler) issue(node *agentNode) {
 	root.issuances++
 	if limit := s.config.MaxIssuanceCount; limit != 0 && root.issuances >= limit {
 		node.heap.removeRoot()
+		s.retire(next.pd.ID)
 	} else {
-		node.heap.reschedule(max(next.due, s.now()) + int64(s.config.StartingPeriod))
+		node.heap.reschedule(max(next.due, s.now()) + s.nextInterval(next.pd.ID))
 	}
 	node.issuer.issuances <- next
+}
+
+// addPDState gives a new PD its responsible probing state. Insert assigns IDs
+// densely and in order, so the state is appended. A PD whose ID skips ahead
+// gets no state and keeps its base period, rather than growing the slice to
+// its ID.
+func (s *Scheduler) addPDState(pdID uint32) {
+	st := pdState{period: int64(s.config.StartingPeriod)}
+	switch n := uint64(len(s.pdStates)); {
+	case uint64(pdID) < n:
+		s.pdStates[pdID] = st
+	case uint64(pdID) == n:
+		s.pdStates = append(s.pdStates, st)
+	}
+}
+
+// applyFIE moves the predicted near and far addresses of the FIE's PD to the
+// addresses that replied, and their loads with them. A missing reply keeps
+// the prediction. FIEs of unknown or retired PDs are ignored, and so are all
+// FIEs while responsible probing is disabled.
+func (s *Scheduler) applyFIE(fie *FIE) {
+	if s.config.PerAddressImpactThreshold == 0 || uint64(fie.PDID) >= uint64(len(s.pdStates)) {
+		return
+	}
+	st := &s.pdStates[fie.PDID]
+	if st.retired {
+		return
+	}
+	rate := float64(time.Second) / float64(st.period)
+	s.moveSlot(&st.near, fie.Near, rate)
+	s.moveSlot(&st.far, fie.Far, rate)
+}
+
+// moveSlot points a slot at addr, moving rate from the old address's load to
+// the new one. The common case of an unchanged address needs no map lookup.
+func (s *Scheduler) moveSlot(slot *uint32, addr netip.Addr, rate float64) {
+	if !addr.IsValid() || (*slot != 0 && s.addrs[*slot].addr == addr) {
+		return
+	}
+	idx, ok := s.addrIndex[addr]
+	if !ok {
+		idx = uint32(len(s.addrs)) //nolint:gosec // G115: at most one address per PD slot
+		s.addrs = append(s.addrs, addrLoad{addr: addr})
+		s.addrIndex[addr] = idx
+	}
+	s.unload(*slot, rate)
+	s.addrs[idx].load += rate
+	*slot = idx
+}
+
+// unload takes rate off the load of address idx, clamped at 0 against float
+// drift. Index 0 stays at 0.
+func (s *Scheduler) unload(idx uint32, rate float64) {
+	if idx != 0 {
+		s.addrs[idx].load = max(0, s.addrs[idx].load-rate)
+	}
+}
+
+// retire removes a PD that left the schedule from the loads of its addresses.
+func (s *Scheduler) retire(pdID uint32) {
+	if uint64(pdID) >= uint64(len(s.pdStates)) {
+		return
+	}
+	st := &s.pdStates[pdID]
+	rate := float64(time.Second) / float64(st.period)
+	s.unload(st.near, rate)
+	s.unload(st.far, rate)
+	st.near, st.far, st.retired = 0, 0, true
+}
+
+// addressLoad returns the load of addr in hits per second, 0 if unknown.
+func (s *Scheduler) addressLoad(addr netip.Addr) float64 {
+	if idx, ok := s.addrIndex[addr]; ok {
+		return s.addrs[idx].load
+	}
+	return 0
+}
+
+// nextInterval returns the time in nanoseconds until the PD is due again
+// after an issuance now: P · max(1, M/Λ), where M is the larger load of its
+// predicted addresses, or P while responsible probing is disabled.
+func (s *Scheduler) nextInterval(pdID uint32) int64 {
+	if uint64(pdID) >= uint64(len(s.pdStates)) {
+		return int64(s.config.StartingPeriod)
+	}
+	st := &s.pdStates[pdID]
+	threshold := s.config.PerAddressImpactThreshold
+	if threshold == 0 {
+		return st.period
+	}
+	m := max(s.addrs[st.near].load, s.addrs[st.far].load)
+	if m <= threshold {
+		return st.period
+	}
+	return int64(float64(st.period) * m / threshold)
 }
 
 // Issuer issues the PDs of one agent. Issue must be called from one goroutine;

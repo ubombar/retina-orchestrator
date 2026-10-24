@@ -43,6 +43,7 @@ func run() error {
 	flag.DurationVar(&config.Scheduler.StartingPeriod, "scheduler-starting-period", 10*time.Second, "Issuance period of every new PD, and the delay before its first issuance")
 	flag.Uint64Var(&config.Scheduler.MaxIssuanceCount, "scheduler-max-issuance-count", 0, "Number of times each PD is issued before it leaves the schedule (0 for indefinitely)")
 	flag.IntVar(&config.Scheduler.EventQueueSize, "scheduler-event-queue-size", 1024, "Size of the scheduler event queue (at least 1)")
+	flag.Float64Var(&config.Scheduler.PerAddressImpactThreshold, "scheduler-per-address-impact-threshold", 1, "Responsible probing: maximum hits per second on any one address (0 disables)")
 
 	flag.StringVar(&config.Capturer.CaptureDir, "capturer-capture-dir", "./capture", "Directory where the fies2a capture files are written")
 	flag.BoolVar(&config.Capturer.AllowNonEmptyCaptureDir, "capturer-allow-non-empty-capture-dir", false, "Allow capturing into a directory that already has files")
