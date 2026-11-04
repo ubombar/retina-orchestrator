@@ -60,15 +60,17 @@ const (
 	eventConnect
 	eventDisconnect
 	eventIssue
+	eventStats
 )
 
 // event is a request to the scheduler goroutine.
 type event struct {
 	kind   eventKind
-	pds    []PD         // eventInsert
-	fie    *FIE         // eventUpdate
-	issuer *Issuer      // eventConnect, eventDisconnect, eventIssue
-	reply  chan<- error // eventConnect
+	pds    []PD           // eventInsert
+	fie    *FIE           // eventUpdate
+	issuer *Issuer        // eventConnect, eventDisconnect, eventIssue
+	reply  chan<- error   // eventConnect
+	stats  chan<- RPStats // eventStats
 }
 
 // issuance is the scheduler's answer to an issue request: a PD and the time
@@ -117,6 +119,25 @@ type Scheduler struct {
 	// its index in addrs.
 	addrs     []addrLoad
 	addrIndex map[netip.Addr]uint32
+	// delayedPDs counts the PDs whose last interval was longer than their
+	// base period.
+	delayedPDs int
+}
+
+// RPStats describes the responsible probing state of the scheduler.
+type RPStats struct {
+	// PDs is the number of PDs in the schedule, retired ones included.
+	PDs int
+	// DelayedPDs is the number of PDs whose last interval was longer than
+	// their base period.
+	DelayedPDs int
+	// Addresses is the number of predicted addresses.
+	Addresses int
+	// OverloadedAddresses is the number of addresses whose load is above the
+	// threshold.
+	OverloadedAddresses int
+	// MaxLoad is the highest load of an address, in hits per second.
+	MaxLoad float64
 }
 
 // pdState is what responsible probing keeps per PD.
@@ -126,6 +147,9 @@ type pdState struct {
 	// period is the base period P of the PD, in nanoseconds.
 	period  int64
 	retired bool
+	// delayed is set while the last interval of the PD was longer than its
+	// base period.
+	delayed bool
 }
 
 // addrLoad is a predicted address and its load in hits per second.
@@ -231,6 +255,21 @@ func (s *Scheduler) NewIssuer(agentID string) (*Issuer, error) {
 	}
 }
 
+// Stats returns the responsible probing state of the scheduler. It costs one
+// pass over the predicted addresses on the scheduler goroutine.
+func (s *Scheduler) Stats() (RPStats, error) {
+	reply := make(chan RPStats, 1)
+	if err := s.send(event{kind: eventStats, stats: reply}); err != nil {
+		return RPStats{}, err
+	}
+	select {
+	case stats := <-reply:
+		return stats, nil
+	case <-s.stopped:
+		return RPStats{}, ErrSchedulerStopped
+	}
+}
+
 // now returns the nanoseconds elapsed since the scheduler's epoch, on the
 // monotonic clock.
 func (s *Scheduler) now() int64 {
@@ -277,13 +316,10 @@ func (s *Scheduler) apply(ev *event) {
 		s.applyFIE(ev.fie)
 
 	case eventConnect:
-		node := s.node(ev.issuer.agentID)
-		if node.issuer != nil {
-			ev.reply <- fmt.Errorf("agent %q already has an issuer", ev.issuer.agentID)
-			return
-		}
-		node.issuer = ev.issuer
-		ev.reply <- nil
+		s.connect(ev)
+
+	case eventStats:
+		ev.stats <- s.rpStats()
 
 	case eventDisconnect:
 		if node := s.nodes[ev.issuer.agentID]; node != nil && node.issuer == ev.issuer {
@@ -304,6 +340,18 @@ func (s *Scheduler) apply(ev *event) {
 		}
 		s.issue(node)
 	}
+}
+
+// connect attaches the event's issuer to its agent, unless the agent already
+// has one, and answers on the event's reply channel.
+func (s *Scheduler) connect(ev *event) {
+	node := s.node(ev.issuer.agentID)
+	if node.issuer != nil {
+		ev.reply <- fmt.Errorf("agent %q already has an issuer", ev.issuer.agentID)
+		return
+	}
+	node.issuer = ev.issuer
+	ev.reply <- nil
 }
 
 // node returns the node of agentID, creating it if needed.
@@ -329,7 +377,9 @@ func (s *Scheduler) issue(node *agentNode) {
 		node.heap.removeRoot()
 		s.retire(next.pd.ID)
 	} else {
-		node.heap.reschedule(max(next.due, s.now()) + s.nextInterval(next.pd.ID))
+		interval := s.nextInterval(next.pd.ID)
+		s.setDelayed(next.pd.ID, interval)
+		node.heap.reschedule(max(next.due, s.now()) + interval)
 	}
 	node.issuer.issuances <- next
 }
@@ -399,7 +449,46 @@ func (s *Scheduler) retire(pdID uint32) {
 	rate := float64(time.Second) / float64(st.period)
 	s.unload(st.near, rate)
 	s.unload(st.far, rate)
-	st.near, st.far, st.retired = 0, 0, true
+	if st.delayed {
+		s.delayedPDs--
+	}
+	st.near, st.far, st.retired, st.delayed = 0, 0, true, false
+}
+
+// setDelayed records whether the PD's next interval is longer than its base
+// period, keeping delayedPDs up to date.
+func (s *Scheduler) setDelayed(pdID uint32, interval int64) {
+	if uint64(pdID) >= uint64(len(s.pdStates)) {
+		return
+	}
+	st := &s.pdStates[pdID]
+	delayed := interval > st.period
+	switch {
+	case delayed && !st.delayed:
+		s.delayedPDs++
+	case !delayed && st.delayed:
+		s.delayedPDs--
+	}
+	st.delayed = delayed
+}
+
+// rpStats returns the current responsible probing state. It scans the
+// addresses, so it is meant to be called rarely.
+func (s *Scheduler) rpStats() RPStats {
+	stats := RPStats{
+		PDs:        len(s.pdStates),
+		DelayedPDs: s.delayedPDs,
+		Addresses:  len(s.addrs) - 1,
+	}
+	threshold := s.config.PerAddressImpactThreshold
+	for i := 1; i < len(s.addrs); i++ {
+		load := s.addrs[i].load
+		stats.MaxLoad = max(stats.MaxLoad, load)
+		if threshold != 0 && load > threshold {
+			stats.OverloadedAddresses++
+		}
+	}
+	return stats
 }
 
 // addressLoad returns the load of addr in hits per second, 0 if unknown.

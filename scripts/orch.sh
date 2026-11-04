@@ -17,6 +17,8 @@ Env:
   RETINA_SECRET          shared secret agents authenticate with (required)
   STARTING_PERIOD        issuance period of every PD (default: 10s)
   MAX_ISSUANCE_COUNT     issuances per PD, 0 for indefinitely (default: 0)
+  RP_THRESHOLD           responsible probing: maximum hits per second on any
+                         one address, 0 to disable it (default: 0)
 USAGE
 	exit 1
 }
@@ -30,9 +32,11 @@ fi
 
 STARTING_PERIOD="${STARTING_PERIOD:-10s}"
 MAX_ISSUANCE_COUNT="${MAX_ISSUANCE_COUNT:-0}"
+RP_THRESHOLD="${RP_THRESHOLD:-0}"
 CAPTURE_DIR="./captures/$(date -u +%Y%m%d_%H%M%S)"
 
 log "capturing into ${CAPTURE_DIR}"
+log "starting period ${STARTING_PERIOD}, responsible probing threshold ${RP_THRESHOLD} (0 = off)"
 
 exec ./retina-orchestrator \
 	--agent-addr=":50050" \
@@ -47,6 +51,7 @@ exec ./retina-orchestrator \
 	--scheduler-starting-period="${STARTING_PERIOD}" \
 	--scheduler-max-issuance-count="${MAX_ISSUANCE_COUNT}" \
 	--scheduler-event-queue-size=1024 \
+	--scheduler-per-address-impact-threshold="${RP_THRESHOLD}" \
 	--capturer-capture-dir="${CAPTURE_DIR}/fies" \
 	--capturer-allow-non-empty-capture-dir=false \
 	--capturer-rotation-interval=15m \

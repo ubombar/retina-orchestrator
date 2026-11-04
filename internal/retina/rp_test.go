@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"testing"
+	"time"
 )
 
 // rpPeriodSeconds is testPeriod in seconds.
@@ -240,5 +241,124 @@ func TestRP_ValidateRejectsBadThreshold(t *testing.T) {
 		if err := config.validate(); err != nil {
 			t.Errorf("threshold %v: %v", v, err)
 		}
+	}
+}
+
+// rpLongPeriod is long enough that an issuance is never late in these tests,
+// so a PD is due again exactly one interval after its previous due time.
+const rpLongPeriod = time.Hour
+
+// newRPIssueScheduler returns a scheduler that is not running, with n PDs of
+// agent "a1" inserted directly (IDs 0..n-1) and an issuer connected for them.
+func newRPIssueScheduler(t *testing.T, threshold float64, n int) (*Scheduler, *Issuer) {
+	t.Helper()
+	config := &SchedulerConfig{StartingPeriod: rpLongPeriod, EventQueueSize: 16, PerAddressImpactThreshold: threshold}
+	if err := config.validate(); err != nil {
+		t.Fatal(err)
+	}
+	s := NewScheduler(config)
+	pds := make([]PD, n)
+	for i := range pds {
+		pds[i] = PD{ID: uint32(i), AgentID: "a1", Destination: netip.MustParseAddr("192.0.2.1")} //nolint:gosec // G115: small n
+	}
+	s.apply(&event{kind: eventInsert, pds: pds})
+	issuer := &Issuer{scheduler: s, agentID: "a1", issuances: make(chan issuance, 1), closed: make(chan struct{})}
+	reply := make(chan error, 1)
+	s.apply(&event{kind: eventConnect, issuer: issuer, reply: reply})
+	if err := <-reply; err != nil {
+		t.Fatal(err)
+	}
+	return s, issuer
+}
+
+// issueAll issues every PD of agent "a1" once, through the issue path.
+func issueAll(t *testing.T, s *Scheduler, issuer *Issuer) {
+	t.Helper()
+	for range s.nodes["a1"].pds {
+		s.apply(&event{kind: eventIssue, issuer: issuer})
+		select {
+		case <-issuer.issuances:
+		default:
+			t.Fatal("no PD was issued")
+		}
+	}
+}
+
+// dues returns the due time of each PD of agent "a1", indexed by PD ID.
+func dues(s *Scheduler) []int64 {
+	node := s.nodes["a1"]
+	out := make([]int64, len(node.pds))
+	for _, entry := range node.heap {
+		out[node.pds[entry.index].ID] = entry.due
+	}
+	return out
+}
+
+func checkDues(t *testing.T, s *Scheduler, before []int64, factor float64) {
+	t.Helper()
+	want := int64(float64(rpLongPeriod) * factor)
+	for id, due := range dues(s) {
+		if got := due - before[id]; got != want {
+			t.Errorf("PD %d: due %v after its previous due time, want %v", id, time.Duration(got), time.Duration(want))
+		}
+	}
+}
+
+func checkStats(t *testing.T, s *Scheduler, want RPStats) {
+	t.Helper()
+	got := s.rpStats()
+	if got.PDs != want.PDs || got.DelayedPDs != want.DelayedPDs || got.Addresses != want.Addresses ||
+		got.OverloadedAddresses != want.OverloadedAddresses || !rpClose(got.MaxLoad, want.MaxLoad) {
+		t.Errorf("stats: got %+v, want %+v", got, want)
+	}
+}
+
+func TestRP_IssueDelaysAndReturnsToBasePeriod(t *testing.T) {
+	const n = 3
+	p := rpLongPeriod.Seconds()
+	// The shared far address has load n/P, so Λ = 1/P slows each PD by n.
+	s, issuer := newRPIssueScheduler(t, 1/p, n)
+	for id := range uint32(n) {
+		s.applyFIE(rpFIE(id, rpAddr(10+int(id)), rpAddr(1)))
+	}
+
+	before := dues(s)
+	issueAll(t, s, issuer)
+	checkDues(t, s, before, n)
+	checkStats(t, s, RPStats{PDs: n, DelayedPDs: n, Addresses: n + 1, OverloadedAddresses: 1, MaxLoad: n / p})
+
+	// The route changes: each PD now has its own far address.
+	for id := range uint32(n) {
+		s.applyFIE(rpFIE(id, rpAddr(10+int(id)), rpAddr(20+int(id))))
+	}
+	before = dues(s)
+	issueAll(t, s, issuer)
+	checkDues(t, s, before, 1)
+	checkStats(t, s, RPStats{PDs: n, DelayedPDs: 0, Addresses: 2*n + 1, OverloadedAddresses: 0, MaxLoad: 1 / p})
+}
+
+func TestRP_DisabledIssuesAtBasePeriod(t *testing.T) {
+	const n = 3
+	s, issuer := newRPIssueScheduler(t, 0, n)
+	for id := range uint32(n) {
+		s.applyFIE(rpFIE(id, rpAddr(10+int(id)), rpAddr(1)))
+	}
+	for range 2 {
+		before := dues(s)
+		issueAll(t, s, issuer)
+		checkDues(t, s, before, 1)
+	}
+	checkStats(t, s, RPStats{PDs: n})
+}
+
+func TestRP_StatsThroughRun(t *testing.T) {
+	s, _ := startScheduler(t, 0)
+	insertPD(t, s, "a1")
+	stats, err := s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.PDs != 1 || stats.DelayedPDs != 0 || stats.Addresses != 0 {
+		t.Errorf("stats: got %+v", stats)
 	}
 }

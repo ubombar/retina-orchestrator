@@ -104,6 +104,13 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		ReadHeaderTimeout: o.config.API.ReadHeaderTimeout,
 	}
 
+	sc := &o.config.Scheduler
+	o.logger.Info("Scheduler config",
+		slog.Duration("starting_period", sc.StartingPeriod),
+		slog.Uint64("max_issuance_count", sc.MaxIssuanceCount),
+		slog.Bool("responsible_probing", sc.PerAddressImpactThreshold != 0),
+		slog.Float64("per_address_impact_threshold", sc.PerAddressImpactThreshold))
+
 	group, ctx := errgroup.WithContext(ctx)
 
 	group.Go(func() error {
@@ -127,6 +134,13 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		return o.runCapturer(ctx)
 	})
 
+	if sc.PerAddressImpactThreshold != 0 {
+		group.Go(func() error {
+			o.logRPStats(ctx)
+			return nil
+		})
+	}
+
 	group.Go(func() error {
 		for {
 			conn, err := listener.Accept()
@@ -144,6 +158,33 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	})
 
 	return group.Wait()
+}
+
+// rpStatsPeriod is how often the responsible probing state is logged.
+const rpStatsPeriod = time.Minute
+
+// logRPStats logs the responsible probing state of the scheduler every
+// rpStatsPeriod until ctx is done or the scheduler stops.
+func (o *Orchestrator) logRPStats(ctx context.Context) {
+	ticker := time.NewTicker(rpStatsPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		stats, err := o.scheduler.Stats()
+		if err != nil {
+			return
+		}
+		o.logger.Info("Responsible probing",
+			slog.Int("pds", stats.PDs),
+			slog.Int("delayed_pds", stats.DelayedPDs),
+			slog.Int("addresses", stats.Addresses),
+			slog.Int("overloaded_addresses", stats.OverloadedAddresses),
+			slog.Float64("max_load", stats.MaxLoad))
+	}
 }
 
 // serveAgent handles one agent connection until it fails or ctx is done. A
