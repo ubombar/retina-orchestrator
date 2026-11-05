@@ -7,9 +7,9 @@
 # shutdown. Run it once with --rp off and once with --rp on, with the same PDs.
 #
 # Run it from the repository root, like orch.sh, inside tmux or screen.
-# Logs, in the current directory:
-#   rp_experiment_<time>_rp-<on|off>.log       events of this script
-#   rp_experiment_<time>_rp-<on|off>.orch.log  output of the orchestrator
+# Logs, in ./logs (created if needed):
+#   logs/rp_experiment_<time>_rp-<on|off>.log       events of this script
+#   logs/rp_experiment_<time>_rp-<on|off>.orch.log  output of the orchestrator
 
 set -euo pipefail
 
@@ -108,8 +108,10 @@ AGENT_TIMEOUT_S=$(to_seconds "$AGENT_TIMEOUT")
 DURATION_S=$(to_seconds "$DURATION")
 
 STAMP=$(date -u +%Y%m%d_%H%M%S)
-LOG="./rp_experiment_${STAMP}_rp-${RP}.log"
-ORCH_LOG="./rp_experiment_${STAMP}_rp-${RP}.orch.log"
+LOG_DIR=./logs
+mkdir -p "$LOG_DIR"
+LOG="${LOG_DIR}/rp_experiment_${STAMP}_rp-${RP}.log"
+ORCH_LOG="${LOG_DIR}/rp_experiment_${STAMP}_rp-${RP}.orch.log"
 ORCH_PID=""
 
 # alive reports whether the orchestrator is still running.
